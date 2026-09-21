@@ -489,9 +489,14 @@ extra graph. When the report did not render, I used AI to
 inspect the error message and identify the Quarto cache issue. These
 interactions helped me understand unfamiliar tools and improve the report's
 readability. A limitation is that suggestions can introduce complexity or
-overlook details in the data. I questioned unfamiliar functions,
-checked the original file format and expected output counts, and reviewed the
-figures and tables.
+overlook details in the data. To review the AI-generated code, I asked for 
+explanations of unfamiliar R and Quarto choices, including here, knitr chunk 
+labels, and package startup messages. I ran the report with Pixi and used 
+AI-assisted checks to compare variable names with the original data and 
+inspect the resulting tables, graphs, and CSV files. Those checks 
+confirmed 4,000 unique admissions and identified an incorrect troponin 
+variable name, which was corrected. This review helped me catch implementation 
+errors.
 
 # Data citations
 
