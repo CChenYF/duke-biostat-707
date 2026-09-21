@@ -1,0 +1,506 @@
+---
+title: "BIOSTAT 707 Checkpoint 1: cohort characterization and EDA"
+author: "Yifei Chen"
+date: now
+format:
+  html:
+    embed-resources: true
+    toc: true
+engine: knitr
+execute:
+  echo: true
+  warning: false
+  error: false
+---
+
+```{r}
+#| label: setup
+#| message: false
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+here::i_am("checkpoint1.qmd")
+data_dir <- here::here("data")
+out_dir <- here::here("output")
+dir.create(out_dir, showWarnings = FALSE)
+expected_n <- 4000L
+
+first_valid <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x)) x[[1]] else NA_real_
+}
+last_valid <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x)) x[[length(x)]] else NA_real_
+}
+min_valid <- function(x) if (all(is.na(x))) NA_real_ else min(x, na.rm = TRUE)
+max_valid <- function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+mean_valid <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+```
+
+# Data and analysis plan
+
+This report describes the 4,000 ICU stays in Challenge 2012 Set A. Each record
+contains observations from the first 48 hours after ICU admission. The outcome
+file is joined for description, while its post-admission fields are kept separate
+from candidate predictors. The input files come from the
+[PhysioNet Challenge 2012 dataset](https://physionet.org/content/challenge-2012/1.0.0/)
+(Silva et al., 2012; full citations below).
+All file paths are relative to this repository. The analysis reads `data/` and
+writes derived files only to `output/`.
+
+```{r}
+#| label: check-inputs
+files <- list.files(
+  file.path(data_dir, "set-a"), pattern = "^[0-9]+\\.txt$", full.names = TRUE
+)
+stopifnot(
+  "Expected 4,000 Set A record files" = length(files) == expected_n,
+  "Outcomes-a.txt is missing" = file.exists(file.path(data_dir, "Outcomes-a.txt"))
+)
+outcomes <- readr::read_csv(
+  file.path(data_dir, "Outcomes-a.txt"), show_col_types = FALSE
+)
+stopifnot(
+  "Expected 4,000 outcome rows" = nrow(outcomes) == expected_n,
+  "Outcome IDs must be unique" = n_distinct(outcomes$RecordID) == expected_n,
+  "Outcome labels must be binary" = all(outcomes$`In-hospital_death` %in% c(0, 1))
+)
+```
+
+# The long table
+
+Each record file has `Time`, `Parameter`, and `Value` columns. The filename and
+the `RecordID` line within the file must agree. `RecordID` becomes a column, so
+that identifying line is omitted from the measurement rows. The original value
+is retained in `Value_raw`; `Value` is the analysis value. PhysioNet defines
+`-1` as missing or unknown and says valid values are nonnegative. Therefore all
+negative values, including other negative codes, become `NA` in `Value`.
+
+```{r}
+#| label: build-long
+read_record <- function(path) {
+  x <- data.table::fread(path, showProgress = FALSE)
+  if (!identical(names(x), c("Time", "Parameter", "Value"))) {
+    stop("Unexpected columns in ", basename(path))
+  }
+  id <- as.integer(tools::file_path_sans_ext(basename(path)))
+  embedded_id <- x[Parameter == "RecordID", Value]
+  if (length(embedded_id) != 1L || embedded_id != id) {
+    stop("RecordID mismatch in ", basename(path))
+  }
+  x[, RecordID := id]
+  x
+}
+long <- data.table::rbindlist(lapply(files, read_record), use.names = TRUE) |>
+  tibble::as_tibble() |>
+  filter(Parameter != "RecordID") |>
+  mutate(
+    hour = as.numeric(substr(Time, 1, 2)) +
+      as.numeric(substr(Time, 4, 5)) / 60,
+    Value_raw = as.numeric(Value),
+    Value = if_else(Value_raw < 0, NA_real_, Value_raw)
+  ) |>
+  select(RecordID, Time, hour, Parameter, Value_raw, Value)
+stopifnot(
+  "Some times could not be parsed" = !anyNA(long$hour),
+  "Times must be within the first 48 hours" = all(between(long$hour, 0, 48)),
+  "Record IDs differ from outcomes" = setequal(unique(long$RecordID), outcomes$RecordID)
+)
+readr::write_csv(long, file.path(out_dir, "set-a_long.csv"))
+```
+
+The long table contains `r format(nrow(long), big.mark = ",")` measurement
+rows from `r n_distinct(long$RecordID)` stays and
+`r n_distinct(long$Parameter)` measurement parameters. There are
+`r format(sum(long$Value_raw == -1), big.mark = ",")` explicit `-1` entries and
+`r sum(long$Value_raw < 0 & long$Value_raw != -1)` other negative entries.
+
+# Data quality and decisions
+
+The following table shows the negative values other than `-1`. Because the
+source documentation says valid measurements are nonnegative, these values are
+also treated as missing in `Value`, while `Value_raw` preserves the evidence.
+
+```{r}
+#| label: negative-values
+invalid_negative <- long |>
+  filter(Value_raw < 0, Value_raw != -1) |>
+  count(Parameter, Value_raw, name = "Rows", sort = TRUE)
+knitr::kable(invalid_negative, caption = "Negative values other than the documented -1 code")
+```
+
+The next summaries expose unusual nonnegative values. The ranges are *review
+flags*, not automatic deletion rules: severe illness and measurement error can
+both produce extreme readings. We retain these values in the derived tables and
+make that choice explicit. An individual value needs clinical and source-data
+review before a later modeling analysis decides whether to exclude it.
+
+```{r}
+#| label: parameter-ranges
+parameter_ranges <- long |>
+  group_by(Parameter) |>
+  summarise(
+    rows = n(), missing_or_invalid = sum(is.na(Value)),
+    minimum = min_valid(Value), median = if (all(is.na(Value))) NA_real_ else median(Value, na.rm = TRUE),
+    maximum = max_valid(Value), .groups = "drop"
+  ) |>
+  arrange(Parameter)
+knitr::kable(parameter_ranges, digits = 2,
+             caption = "Observed ranges after documented and invalid negative values are set to missing")
+```
+
+```{r}
+#| label: plausibility-flags
+bounds <- tibble::tribble(
+  ~Parameter, ~lower, ~upper,
+  "Age", 18, 120,
+  "Height", 100, 230,
+  "Weight", 20, 400,
+  "HR", 20, 250,
+  "RespRate", 4, 60,
+  "Temp", 30, 43,
+  "pH", 6.8, 7.8,
+  "GCS", 3, 15,
+  "FiO2", 0, 1,
+  "SaO2", 50, 100,
+  "Gender", 0, 1,
+  "ICUType", 1, 4
+)
+flags <- long |>
+  inner_join(bounds, by = "Parameter") |>
+  filter(!is.na(Value), Value < lower | Value > upper) |>
+  group_by(Parameter) |>
+  summarise(flagged_rows = n(), smallest = min(Value), largest = max(Value),
+            .groups = "drop") |>
+  arrange(desc(flagged_rows))
+knitr::kable(flags, digits = 2,
+             caption = "Values outside broad screening ranges, retained for review")
+```
+
+These flags include values that may be recording errors, for example a zero
+body temperature or a pH far below a plausible physiological range. They are
+not silently recoded because the documentation gives no correction rule for
+such nonnegative entries. Median summaries below are less sensitive to isolated
+extremes than means, but the wide file retains both summaries for inspection.
+
+# Missingness over time in the long table
+
+An absent row is not marked `NA` in a patient's file. To represent missingness,
+we ask whether each admission has **at least one valid measurement** of each
+time-series parameter in each two-hour interval. The denominator is all
+`r expected_n` admissions, including those with no row for that parameter.
+The final observation at hour 48 belongs to the last interval.
+
+```{r}
+#| label: temporal-missingness
+#| fig-width: 11
+#| fig-height: 9
+time_series_parameters <- sort(setdiff(
+  unique(long$Parameter), c("Age", "Gender", "Height", "ICUType")
+))
+temporal <- long |>
+  filter(Parameter %in% time_series_parameters, !is.na(Value)) |>
+  mutate(bin = pmin(floor(hour / 2), 23L)) |>
+  distinct(RecordID, Parameter, bin) |>
+  count(Parameter, bin, name = "admissions_measured")
+temporal <- tidyr::expand_grid(
+  Parameter = time_series_parameters, bin = 0:23
+) |>
+  left_join(temporal, by = c("Parameter", "bin")) |>
+  mutate(
+    admissions_measured = replace_na(admissions_measured, 0L),
+    proportion_measured = admissions_measured / expected_n,
+    Parameter = factor(Parameter, levels = rev(time_series_parameters))
+  )
+ggplot(temporal, aes(x = bin * 2, y = Parameter, fill = proportion_measured)) +
+  geom_tile() +
+  scale_x_continuous(breaks = seq(0, 46, by = 4), expand = c(0, 0)) +
+  scale_fill_viridis_c(labels = scales::label_percent(), limits = c(0, 1)) +
+  labs(title = "Measurement availability in the first 48 hours",
+       subtitle = "Share of all 4,000 admissions with a valid reading in each two-hour interval",
+       x = "Hours since ICU admission (interval start)", y = NULL,
+       fill = "Measured") +
+  theme_minimal(base_size = 10)
+```
+
+This graph describes the *measurement process*, not just explicit `-1` codes.
+Variables with sparse or changing coverage may reflect clinical decisions about
+testing as well as gaps in recording. The map does not establish why a
+measurement is absent.
+
+# The wide table
+
+The wide table has one row per admission. Admission descriptors come from the
+`00:00` entries. For each time-series parameter, it includes count, first,
+last, minimum, maximum, and mean of valid readings in **0 to under 24 hours**
+and **24 through 48 hours**. This preserves some change over time. A count of
+zero means the variable was not validly measured in that window; its other
+summaries remain missing. No imputation is performed.
+
+```{r}
+#| label: build-wide
+static_parameters <- c("Age", "Gender", "Height", "ICUType", "Weight")
+static <- long |>
+  filter(hour == 0, Parameter %in% static_parameters) |>
+  group_by(RecordID, Parameter) |>
+  summarise(Value = first_valid(Value), .groups = "drop") |>
+  pivot_wider(names_from = Parameter, values_from = Value)
+static <- tibble::tibble(RecordID = outcomes$RecordID) |>
+  left_join(static, by = "RecordID")
+
+series_summaries <- long |>
+  filter(Parameter %in% time_series_parameters) |>
+  mutate(window = if_else(hour < 24, "h00_24", "h24_48")) |>
+  arrange(RecordID, Parameter, hour) |>
+  group_by(RecordID, Parameter, window) |>
+  summarise(
+    count = sum(!is.na(Value)),
+    first = first_valid(Value), last = last_valid(Value),
+    min = min_valid(Value), max = max_valid(Value), mean = mean_valid(Value),
+    .groups = "drop"
+  )
+series_complete <- tidyr::expand_grid(
+  RecordID = outcomes$RecordID,
+  Parameter = time_series_parameters,
+  window = c("h00_24", "h24_48")
+) |>
+  left_join(series_summaries, by = c("RecordID", "Parameter", "window")) |>
+  mutate(count = replace_na(count, 0L))
+wide_measurements <- series_complete |>
+  pivot_wider(
+    names_from = c(Parameter, window),
+    values_from = c(count, first, last, min, max, mean),
+    names_glue = "{Parameter}_{.value}_{window}"
+  )
+wide <- static |>
+  left_join(wide_measurements, by = "RecordID") |>
+  left_join(outcomes, by = "RecordID") |>
+  mutate(
+    `SAPS-I` = na_if(`SAPS-I`, -1),
+    SOFA = na_if(SOFA, -1),
+    Length_of_stay = na_if(Length_of_stay, -1)
+  )
+stopifnot(
+  "Wide table should have 4,000 rows" = nrow(wide) == expected_n,
+  "Wide IDs must be unique" = n_distinct(wide$RecordID) == expected_n,
+  "HR counts disagree with long table" =
+    sum(wide$HR_count_h00_24 + wide$HR_count_h24_48) ==
+      sum(long$Parameter == "HR" & !is.na(long$Value))
+)
+readr::write_csv(wide, file.path(out_dir, "set-a_wide.csv"))
+```
+
+The wide table contains `r nrow(wide)` admissions and `r ncol(wide)` columns.
+We retained the outcome fields for descriptive comparisons. They must be
+excluded from future prediction features. In particular, in-hospital death,
+length of stay, and survival time are known only after the prediction window;
+the supplied SAPS-I and SOFA scores should not be assumed to be usable
+predictors without confirming their calculation time and inputs.
+
+# Table for cohort characteristics
+
+Table 1 summarizes admission characteristics and supplied severity scores
+overall and by in-hospital death. Continuous entries use median and
+interquartile range; categorical entries use count and percent. The severity
+scores are descriptive here, not proposed model inputs.
+
+```{r}
+#| label: table1
+table1_data <- wide |>
+  mutate(
+    Death = factor(if_else(`In-hospital_death` == 1, "Died", "Survived"),
+                   levels = c("Survived", "Died")),
+    Sex = factor(Gender, levels = c(0, 1), labels = c("Female", "Male")),
+    ICU = factor(ICUType, levels = 1:4,
+                 labels = c("Coronary care", "Cardiac surgery recovery",
+                            "Medical ICU", "Surgical ICU"))
+  ) |>
+  select(Death, Age, Sex, ICU, Height, Weight, `SAPS-I`, SOFA)
+gtsummary::tbl_summary(
+  table1_data,
+  by = Death,
+  statistic = list(
+    gtsummary::all_continuous() ~ "{median} ({p25}, {p75})",
+    gtsummary::all_categorical() ~ "{n} ({p}%)"
+  ),
+  missing = "ifany"
+) |>
+  gtsummary::add_overall(last = FALSE)
+```
+
+# Outcome summary
+
+In-hospital death is the binary outcome: 1 means death during the hospital
+stay. The `Survival` field uses `-1` when no death was recorded, so it is not
+interpreted as an ordinary negative duration.
+
+```{r}
+#| label: outcomes
+n_deaths <- sum(wide$`In-hospital_death` == 1)
+death_rate <- n_deaths / nrow(wide)
+los <- wide$Length_of_stay
+outcome_table <- tibble::tibble(
+  Measure = c("Admissions", "In-hospital deaths", "Survivors",
+              "In-hospital mortality", "Length of stay, median (IQR), days",
+              "Length of stay, range, days"),
+  Result = c(
+    format(nrow(wide), big.mark = ","), format(n_deaths, big.mark = ","),
+    format(nrow(wide) - n_deaths, big.mark = ","),
+    sprintf("%.1f%%", 100 * death_rate),
+    sprintf("%.1f (%.1f, %.1f)", median(los, na.rm = TRUE),
+            quantile(los, 0.25, na.rm = TRUE), quantile(los, 0.75, na.rm = TRUE)),
+    sprintf("%.0f to %.0f", min(los, na.rm = TRUE), max(los, na.rm = TRUE))
+  )
+)
+knitr::kable(outcome_table)
+```
+
+# Missingness in the wide table
+
+A missing summary mean means no valid reading in that parameter and window.
+The count columns deliberately hold zero instead of `NA`; plotting those
+columns as missing would hide the measurement pattern. The first plot ranks
+missing proportions for the mean summaries. The second displays selected
+features across a reproducible sample of 200 admissions.
+
+```{r}
+#| label: wide-missingness-rates
+#| fig-width: 9
+#| fig-height: 8
+mean_columns <- grep("_mean_h", names(wide), value = TRUE)
+missing_rates <- tibble::tibble(
+  feature = mean_columns,
+  missing_fraction = colMeans(is.na(wide[mean_columns]))
+) |>
+  arrange(desc(missing_fraction))
+ggplot(head(missing_rates, 30),
+       aes(x = missing_fraction, y = reorder(feature, missing_fraction))) +
+  geom_col(fill = "#3265a8") +
+  scale_x_continuous(labels = scales::label_percent()) +
+  labs(title = "Thirty most frequently absent patient-window summaries",
+       x = "Admissions without a valid measurement", y = NULL) +
+  theme_minimal(base_size = 10)
+```
+
+```{r}
+#| label: wide-missingness-map
+#| fig-width: 11
+#| fig-height: 7
+selected_parameters <- c("HR", "Temp", "RespRate", "Glucose", "Creatinine",
+                         "Lactate", "Albumin", "Platelets", "pH", "FiO2",
+                         "TroponinI", "TroponinT")
+selected_columns <- intersect(
+  as.vector(outer(selected_parameters, c("h00_24", "h24_48"),
+                  function(p, w) paste0(p, "_mean_", w))),
+  names(wide)
+)
+set.seed(707)
+sample_ids <- sample(wide$RecordID, min(200L, nrow(wide)))
+wide_map <- wide |>
+  filter(RecordID %in% sample_ids) |>
+  arrange(RecordID) |>
+  select(RecordID, all_of(selected_columns)) |>
+  mutate(admission_index = row_number()) |>
+  pivot_longer(all_of(selected_columns), 
+                names_to = "feature", values_to = "value") |>
+  mutate(
+    feature = factor(feature, levels = rev(selected_columns)),
+    status = if_else(is.na(value), "Missing", "Measured")
+  )
+ggplot(wide_map, aes(x = admission_index, y = feature, fill = status)) +
+  geom_tile() +
+  scale_fill_manual(values = c(Missing = "#d9dce3", Measured = "#216e8c")) +
+  labs(title = "Missingness map of selected patient-window summaries",
+       x = "Sampled admissions, ordered by RecordID", y = NULL, fill = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_blank())
+```
+
+The different patterns between the two windows matter: a variable may be
+measured only early, only late, or not at all. We preserve those distinctions
+and do not fill absent summaries with an overall mean at this exploratory
+stage.
+
+## Is the missingness informative?
+
+The following descriptive comparison asks whether in-hospital mortality differs
+between stays where a variable was ever validly measured and stays where it
+was not. It does not establish that measuring the variable changes mortality:
+the ordering decision may reflect patient condition and clinical practice.
+
+```{r}
+#| label: measurement-and-death
+chosen_parameters <- c("HR", "Lactate", "Albumin", "TroponinI")
+ever_measured <- long |>
+  filter(Parameter %in% chosen_parameters, !is.na(Value)) |>
+  distinct(RecordID, Parameter) |>
+  mutate(measured = TRUE)
+measurement_death <- tidyr::expand_grid(
+  RecordID = outcomes$RecordID, Parameter = chosen_parameters
+) |>
+  left_join(ever_measured, by = c("RecordID", "Parameter")) |>
+  mutate(measured = replace_na(measured, FALSE)) |>
+  left_join(outcomes |> select(RecordID, `In-hospital_death`), by = "RecordID") |>
+  group_by(Parameter, measured) |>
+  summarise(
+    admissions = n(), deaths = sum(`In-hospital_death` == 1),
+    death_rate = deaths / admissions, .groups = "drop"
+  ) |>
+  mutate(death_rate = scales::percent(death_rate, accuracy = 0.1))
+knitr::kable(measurement_death,
+             caption = "Mortality by whether a variable was ever measured")
+```
+
+# Understanding the eventual Challenge assessment
+
+No model is fitted or scored for Checkpoint 1. For a future binary mortality
+prediction, sensitivity is $TP/(TP+FN)$ and positive predictive value is
+$TP/(TP+FP)$. The Challenge's first criterion is the **smaller** of these two
+numbers, so a high value of only one is insufficient. Its second criterion
+assesses predicted risks: patients are grouped into risk deciles and a modified
+Hosmer–Lemeshow discrepancy compares observed and expected deaths. The original
+Challenge divides that discrepancy by the spread between mean risk in the top
+and bottom deciles ($H/D$). These criteria concern future predictions, not
+the descriptive work in this report. See the
+[Challenge scoring description](https://physionet.org/content/challenge-2012/1.0.0/).
+
+# AI-use statement
+
+I used AI as an editing and learning aid while working with
+R and Quarto. Because `knitr` was new to me, I asked how R chunks are run and
+how their results appear in a rendered document. AI helped me understand less
+familiar choices such as `here` for repository-relative paths and chunk labels
+such as `#| label: check-inputs`. It also helped organize the *Data and analysis
+plan* section. I used AI to refine some descriptions that initially sounded
+too conversational and did not clearly connect the findings to the displayed
+results. The revised wording is more formal and states the observed patterns
+more precisely.
+
+For the missingness map, I used AI feedback to review the tile layout,
+figure size, labels, theme, and colors, including the `geom_tile()` and
+`scale_fill_manual()` settings. AI also suggested retaining an additional
+bar chart because it ranks the widest gaps in measurement coverage across
+all variable-window summaries, whereas the tile map shows patterns for
+individual admissions. After discussing that distinction, I accepted the
+extra graph. When the report did not render, I used AI to
+inspect the error message and identify the Quarto cache issue. These
+interactions helped me understand unfamiliar tools and improve the report's
+readability. A limitation is that suggestions can introduce complexity or
+overlook details in the data. I questioned unfamiliar functions,
+checked the original file format and expected output counts, and reviewed the
+figures and tables.
+
+# Data citations
+
+Silva, I., Moody, G., Mark, R. G., & Celi, L. A. (2012).
+*Predicting Mortality of ICU Patients: The PhysioNet/Computing in Cardiology
+Challenge 2012* (version 1.0.0) [Data set]. PhysioNet.
+<https://physionet.org/content/challenge-2012/1.0.0/>.
+
+Silva, I., Moody, G., Scott, D. J., Celi, L. A., & Mark, R. G. (2012).
+Predicting in-hospital mortality of ICU patients: The PhysioNet/Computing in
+Cardiology Challenge 2012. *Computing in Cardiology, 39*, 245–248.
+<https://physionet.org/files/challenge-2012/1.0.0/papers/0245.pdf>.
