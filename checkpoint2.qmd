@@ -1,0 +1,717 @@
+---
+title: "BIOSTAT 707 Checkpoint 2"
+author: "Yifei Chen"
+date: today
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: true
+    code-summary: "Show Python code"
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+  error: false
+---
+
+```{python}
+#| label: setup
+#| include: false
+from pathlib import Path
+from time import perf_counter
+import warnings
+
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from IPython.display import Markdown, display
+from pygam import LogisticGAM, l, s
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+sns.set_theme(style="whitegrid")
+pd.set_option("display.max_colwidth", 100)
+START_TIME = perf_counter()
+ROOT = Path.cwd()
+DATA_DIR = ROOT / "data"
+OUTPUT_DIR = ROOT / "output"
+OUTPUT_DIR.mkdir(exist_ok=True)
+SEED, EXPECTED_N, OUTER_K, INNER_K = 7072, 4000, 5, 3
+```
+
+# AI-use statement
+
+I used OpenAI Codex to assist with project planning, specific coding 
+challenges, and improving the clarity of my academic writing. I 
+independently selected the statistical models and followed the 
+modeling and evaluation requirements provided in the assignment. 
+During data preparation, Codex helped with reshaping and merging 
+datasets, handling missing values, and improving reproducibility 
+through relative file paths and additional data-cleaning summaries. 
+It also generated the code for calculating time-series slopes, which 
+I reviewed and incorporated into my analysis.
+
+For model evaluation, my original approach involved manually selecting 
+and recording cross-validation folds. I consulted Codex to improve this 
+implementation, and it generated the cross-validation workflow based on 
+the assignment requirements, including hyperparameter tuning, out-of-fold 
+predictions, and LASSO variable-selection tracking. I was already familiar 
+with techniques such as GridSearchCV, but used Codex to help organize the 
+overall workflow. I also consulted Codex for specific preprocessing 
+functions, GAM partial-effect calculations and visualizations, and 
+troubleshooting the conditional logic for interpreting GAM curves. 
+Additionally, Codex helped refine figure labels and suggested adding 
+the Reproducibility and Saved Files section.
+
+Codex was useful for improving coding efficiency, addressing technical 
+challenges, and making the analysis more organized and reproducible. 
+However, some generated code was unnecessarily complicated or required 
+adjustments. I reviewed the suggested code, worked through the logic, 
+tested the results, and checked intermediate outputs and visualizations 
+before incorporating them into my report. The modeling choices, 
+interpretation of results, and final analytical decisions remained 
+my responsibility.
+
+# 2.1 The modeling table
+
+Checkpoint 2 uses only the 4,000 intensive care unit (ICU) stays in Set A and
+`data/Outcomes-a.txt`. The modeling table has one row per stay. Each row contains
+admission descriptors and summaries of measurements collected from hour 0
+through hour 48. `In-hospital_death`, joined by `RecordID`, is the binary
+outcome. The data are from the [PhysioNet/CinC Challenge 2012](https://physionet.org/content/challenge-2012/1.0.0/)
+(Silva et al., 2012; citation at the end of this report).
+
+```{python}
+#| label: read-set-a-only
+set_a_files = sorted((DATA_DIR / "set-a").glob("*.txt"), key=lambda p: int(p.stem))
+outcome_path = DATA_DIR / "Outcomes-a.txt"
+assert len(set_a_files) == EXPECTED_N, "Set A must contain 4,000 records."
+assert outcome_path.exists(), "Outcomes-a.txt is missing."
+
+def read_record(path):
+    frame = pd.read_csv(path)
+    assert list(frame.columns) == ["Time", "Parameter", "Value"]
+    record_id = int(path.stem)
+    embedded = frame.loc[frame["Parameter"].eq("RecordID"), "Value"]
+    assert len(embedded) == 1 and int(embedded.iloc[0]) == record_id
+    frame["RecordID"] = record_id
+    return frame
+
+long_raw = pd.concat([read_record(path) for path in set_a_files], ignore_index=True)
+long_raw = long_raw.loc[~long_raw["Parameter"].eq("RecordID")].copy()
+time_parts = long_raw["Time"].str.split(":", expand=True).astype(float)
+long_raw["hour"] = time_parts[0] + time_parts[1] / 60
+long_raw["Value_raw"] = pd.to_numeric(long_raw["Value"], errors="coerce")
+long_raw = long_raw[["RecordID", "hour", "Parameter", "Value_raw"]]
+outcomes = pd.read_csv(outcome_path)[
+    ["RecordID", "SAPS-I", "SOFA", "In-hospital_death"]
+].copy()
+assert len(outcomes) == EXPECTED_N and outcomes["RecordID"].nunique() == EXPECTED_N
+assert set(outcomes["In-hospital_death"].unique()).issubset({0, 1})
+assert long_raw["hour"].between(0, 48).all()
+```
+
+The Checkpoint 1 rule that negative values are invalid is retained. For
+modeling, I additionally recode values outside broad physiologic screening
+ranges as missing. This revises Checkpoint 1, where nonnegative outliers were
+flagged but retained. Zero height and zero weight are now missing. The original
+values remain in `Value_raw`, which makes every change auditable.
+
+```{python}
+#| label: clean-set-a
+bounds = pd.DataFrame([
+    ("Age", 18, 120), ("Height", 100, 230), ("Weight", 20, 400),
+    ("HR", 20, 250), ("RespRate", 4, 60), ("Temp", 30, 43),
+    ("pH", 6.8, 7.8), ("GCS", 3, 15), ("FiO2", .20, 1),
+    ("SaO2", 50, 100), ("Gender", 0, 1), ("ICUType", 1, 4),
+], columns=["Parameter", "lower", "upper"])
+long = long_raw.merge(bounds, on="Parameter", how="left")
+long["negative_invalid"] = long["Value_raw"].lt(0)
+long["outside_screen"] = (
+    long["lower"].notna()
+    & (long["Value_raw"].lt(long["lower"]) | long["Value_raw"].gt(long["upper"]))
+    & ~long["negative_invalid"]
+)
+long["Value"] = long["Value_raw"].mask(
+    long["negative_invalid"] | long["outside_screen"]
+)
+cleaning_summary = (
+    long.loc[long["negative_invalid"] | long["outside_screen"]]
+    .groupby("Parameter", as_index=False)
+    .agg(negative_codes=("negative_invalid", "sum"),
+         outside_screening_range=("outside_screen", "sum"),
+         total_set_missing=("Value_raw", "size"))
+    .sort_values("total_set_missing", ascending=False)
+)
+display(cleaning_summary.style.hide(axis="index").set_caption(
+    "Table 1. Values recoded as missing before feature construction"
+))
+```
+
+Table 1 documents every cleaning change. Negative codes account for most
+changes, while `outside_screening_range` identifies the additional broad
+screening decisions used for modeling.
+
+```{python}
+#| label: build-modeling-table
+static_parameters = ["Age", "Gender", "Height", "ICUType", "Weight"]
+series_parameters = sorted(
+    set(long["Parameter"].unique()) - {"Age", "Gender", "Height", "ICUType"}
+)
+static = (
+    long.loc[long["hour"].eq(0) & long["Parameter"].isin(static_parameters)]
+    .sort_values(["RecordID", "Parameter", "hour"])
+    .drop_duplicates(["RecordID", "Parameter"], keep="first")
+    .pivot(index="RecordID", columns="Parameter", values="Value")
+    .rename(columns={"Weight": "Weight_admission"})
+)
+series = long.loc[long["Parameter"].isin(series_parameters)].copy()
+series = series.sort_values(["RecordID", "Parameter", "hour"])
+valid = series.dropna(subset=["Value"]).copy()
+valid["time_value"] = valid["hour"] * valid["Value"]
+valid["time_squared"] = valid["hour"] ** 2
+series_summary = valid.groupby(["RecordID", "Parameter"]).agg(
+    count=("Value", "size"), last=("Value", "last"),
+    minimum=("Value", "min"), maximum=("Value", "max"), mean=("Value", "mean"),
+    sum_time=("hour", "sum"), sum_value=("Value", "sum"),
+    sum_time_value=("time_value", "sum"), sum_time_squared=("time_squared", "sum"),
+)
+denominator = series_summary["count"] * series_summary["sum_time_squared"] - series_summary["sum_time"] ** 2
+series_summary["slope"] = (
+    series_summary["count"] * series_summary["sum_time_value"]
+    - series_summary["sum_time"] * series_summary["sum_value"]
+) / denominator.replace(0, np.nan)
+series_summary = series_summary[["count", "last", "minimum", "maximum", "mean", "slope"]]
+complete_index = pd.MultiIndex.from_product(
+    [outcomes["RecordID"], series_parameters], names=["RecordID", "Parameter"]
+)
+series_summary = series_summary.reindex(complete_index)
+series_summary["count"] = series_summary["count"].fillna(0).astype(int)
+series_summary["never"] = series_summary["count"].eq(0).astype(int)
+series_wide = series_summary.unstack("Parameter")
+series_wide.columns = [f"{parameter}_{stat}" for stat, parameter in series_wide.columns]
+modeling = (
+    outcomes[["RecordID"]].set_index("RecordID")
+    .join(static, how="left").join(series_wide, how="left")
+    .join(outcomes.set_index("RecordID")[["SAPS-I", "SOFA", "In-hospital_death"]])
+    .reset_index()
+)
+modeling["SAPS-I"] = modeling["SAPS-I"].replace(-1, np.nan)
+modeling["SOFA"] = modeling["SOFA"].replace(-1, np.nan)
+modeling["outcome"] = modeling.pop("In-hospital_death").astype(int)
+for name in ["Height", "Weight_admission", "Age"]:
+    modeling[f"{name}_missing"] = modeling[name].isna().astype(int)
+modeling["Gender"] = modeling["Gender"].map({0: "Female", 1: "Male"}).fillna("Unknown")
+modeling["ICUType"] = modeling["ICUType"].map({
+    1: "Coronary care", 2: "Cardiac surgery recovery",
+    3: "Medical ICU", 4: "Surgical ICU",
+}).fillna("Unknown")
+assert len(modeling) == EXPECTED_N
+assert modeling["RecordID"].nunique() == EXPECTED_N
+assert modeling["outcome"].notna().all()
+modeling.to_csv(OUTPUT_DIR / "cp2_modeling_table.csv", index=False)
+n_deaths = int(modeling["outcome"].sum())
+death_rate = modeling["outcome"].mean()
+display(Markdown(
+    f"The modeling table contains **{len(modeling):,} stays**, **{n_deaths:,} deaths**, "
+    f"and an in-hospital mortality rate of **{death_rate:.1%}**. Its one-row-per-stay "
+    "layout is checked explicitly, so ordinary stratified folds are also folds by stay."
+))
+```
+
+# 2.2 Predictors
+
+Only data from hours 0 through 48 are predictors. `RecordID` is an identifier;
+length of stay and survival are not read into the modeling table; and SAPS-I and
+SOFA are reserved as benchmarks. ICU type is categorical. The time-series
+features retain current level, range, average level, linear direction,
+measurement intensity, and whether a variable was never measured.
+
+```{python}
+#| label: predictor-groups
+predictor_groups = pd.DataFrame([
+    ("Admission descriptors", 5, "Baseline age, sex, body size, and ICU context."),
+    ("Last, minimum, maximum, and mean", 4 * len(series_parameters), "Level and extremes summarize severity over 48 hours."),
+    ("Slope", len(series_parameters), "Direction may distinguish improvement from deterioration."),
+    ("Measurement count", len(series_parameters), "Monitoring intensity can reflect clinical concern."),
+    ("Never-measured indicators", len(series_parameters) + 3, "Missingness can be informative."),
+], columns=["Group", "Count", "Clinical reason"])
+excluded_columns = ["RecordID", "outcome", "SAPS-I", "SOFA"]
+feature_columns = [name for name in modeling.columns if name not in excluded_columns]
+categorical_features = ["Gender", "ICUType"]
+numeric_features = [name for name in feature_columns if name not in categorical_features]
+X, y = modeling[feature_columns].copy(), modeling["outcome"].to_numpy()
+predictor_groups.loc[len(predictor_groups)] = [
+    "Total before categorical expansion", len(feature_columns),
+    "Full candidate set used by Models 1 and 3."
+]
+display(predictor_groups.style.hide(axis="index").set_caption(
+    "Table 2. Predictor groups and clinical rationale"
+))
+```
+
+The count and never-measured features retain missingness information before
+median imputation. No observed time-series parameter was dropped for being
+rarely measured; the exclusion threshold was zero valid stays. This avoids
+outcome-informed screening before CV. Constant columns are removed using
+training data only.
+
+# 2.3 Cross-validation design
+
+I use five-fold stratified cross-validation. Every model and both
+benchmarks use the same outer folds. LASSO and random-forest tuning use
+three-fold CV inside each outer training fold and minimize Brier score. Median
+imputation, constant-column removal, scaling, one-hot encoding, and tuning are
+fit within training data and then applied to validation or held-out data.
+
+```{python}
+#| label: cross-validation-design
+outer_cv = StratifiedKFold(n_splits=OUTER_K, shuffle=True, random_state=SEED)
+outer_splits = list(outer_cv.split(X, y))
+outer_fold = np.empty(len(y), dtype=int)
+for fold, (_, test_index) in enumerate(outer_splits, start=1):
+    outer_fold[test_index] = fold
+fold_balance = (
+    pd.DataFrame({"fold": outer_fold, "outcome": y}).value_counts(["fold", "outcome"])
+    .unstack(fill_value=0).rename(columns={0: "Survived", 1: "Died"}).reset_index()
+)
+fold_balance["Death rate"] = fold_balance["Died"] / (fold_balance["Survived"] + fold_balance["Died"])
+display(fold_balance.style.hide(axis="index").format({"Death rate": "{:.1%}"}).set_caption(
+    "Table 3. Fixed outer folds shared by every model and benchmark"
+))
+```
+
+Table 3 confirms successful stratification. Because there is one row per stay,
+no stay can occur in both training and held-out data.
+
+```{python}
+#| label: model-definitions
+category_levels = [
+    ["Female", "Male", "Unknown"],
+    ["Coronary care", "Cardiac surgery recovery", "Medical ICU", "Surgical ICU", "Unknown"],
+]
+def make_preprocessor(scale_numeric):
+    steps = [("impute", SimpleImputer(strategy="median"))]
+    if scale_numeric:
+        steps.append(("scale", StandardScaler()))
+    return ColumnTransformer([
+        ("numeric", Pipeline(steps), numeric_features),
+        ("categorical", OneHotEncoder(categories=category_levels, handle_unknown="ignore", sparse_output=False), categorical_features),
+    ], sparse_threshold=0, verbose_feature_names_out=False)
+
+def make_lasso_pipeline():
+    return Pipeline([
+        ("preprocess", make_preprocessor(True)), ("remove_constant", VarianceThreshold()),
+        ("model", LogisticRegression(l1_ratio=1, solver="saga", max_iter=3000, random_state=SEED)),
+    ])
+
+def make_forest_pipeline():
+    return Pipeline([
+        ("preprocess", make_preprocessor(False)), ("remove_constant", VarianceThreshold()),
+        ("model", RandomForestClassifier(n_estimators=250, random_state=SEED, n_jobs=-1, class_weight="balanced_subsample")),
+    ])
+
+gam_continuous = [
+    "Age", "HR_mean", "Temp_mean", "RespRate_mean", "MAP_mean",
+    "Creatinine_last", "Lactate_last", "GCS_last", "BUN_last", "pH_last",
+    "Urine_mean", "WBC_last",
+]
+gam_linear, gam_categories = ["MechVent_maximum"], ["Gender", "ICUType"]
+
+def fit_gam_preprocessor(frame):
+    imputer = SimpleImputer(strategy="median")
+    scaler = StandardScaler().fit(imputer.fit_transform(frame[gam_continuous]))
+    linear_imputer = SimpleImputer(strategy="median").fit(frame[gam_linear])
+    encoder = OneHotEncoder(categories=category_levels, handle_unknown="ignore", sparse_output=False).fit(frame[gam_categories])
+    return {"continuous_imputer": imputer, "continuous_scaler": scaler,
+            "linear_imputer": linear_imputer, "category_encoder": encoder}
+
+def apply_gam_preprocessor(frame, prep):
+    continuous = prep["continuous_scaler"].transform(prep["continuous_imputer"].transform(frame[gam_continuous]))
+    linear = prep["linear_imputer"].transform(frame[gam_linear])
+    categories = prep["category_encoder"].transform(frame[gam_categories])
+    return np.column_stack([continuous, linear, categories])
+
+def gam_terms():
+    term = s(0, n_splines=4)
+    for index in range(1, len(gam_continuous)):
+        term += s(index, n_splines=4)
+    for index in range(len(gam_continuous), len(gam_continuous) + 9):
+        term += l(index)
+    return term
+```
+
+# 2.4 Model 1: regularized logistic regression
+
+Model 1 is logistic regression with a least absolute shrinkage and selection
+operator (LASSO) penalty. LASSO is appropriate because the engineered feature
+set is large and correlated: it shrinks weak coefficients to zero and produces
+a more compact model. Twelve inverse penalty strengths (`C`) from 0.0032 to
+3.1623 are compared within each outer training set. Numeric predictors are
+standardized; categorical levels are represented by binary indicators.
+
+```{python}
+#| label: nested-cross-validation
+C_GRID = np.logspace(-2.5, 0.5, 12)
+FOREST_GRID = {"model__max_features": ["sqrt", 0.5], "model__min_samples_leaf": [5, 20]}
+model_names = ["LASSO", "GAM", "Random forest", "SAPS-I", "SOFA"]
+oof = pd.DataFrame({
+    "RecordID": modeling["RecordID"], "outcome": y, "fold": outer_fold,
+    "LASSO": np.nan, "GAM": np.nan, "Random forest": np.nan,
+    "SAPS-I": modeling["SAPS-I"], "SOFA": modeling["SOFA"],
+})
+lasso_outer, lasso_selected, forest_outer = [], [], []
+
+for fold, (train_index, test_index) in enumerate(outer_splits, start=1):
+    X_train, X_test, y_train = X.iloc[train_index], X.iloc[test_index], y[train_index]
+    inner_cv = StratifiedKFold(n_splits=INNER_K, shuffle=True, random_state=8000 + fold)
+    lasso_search = GridSearchCV(
+        make_lasso_pipeline(), {"model__C": C_GRID}, scoring="neg_brier_score",
+        cv=inner_cv, n_jobs=-1, refit=True,
+    ).fit(X_train, y_train)
+    oof.loc[test_index, "LASSO"] = lasso_search.predict_proba(X_test)[:, 1]
+    lasso_fit = lasso_search.best_estimator_
+    all_names = lasso_fit.named_steps["preprocess"].get_feature_names_out()
+    kept_names = all_names[lasso_fit.named_steps["remove_constant"].get_support()]
+    coefficients = lasso_fit.named_steps["model"].coef_.ravel()
+    selected = set(kept_names[~np.isclose(coefficients, 0)])
+    lasso_selected.append(selected)
+    lasso_outer.append({"Fold": fold, "C": lasso_search.best_params_["model__C"],
+                        "Selected predictors": len(selected)})
+
+    gam_prep = fit_gam_preprocessor(modeling.iloc[train_index])
+    gam_train = apply_gam_preprocessor(modeling.iloc[train_index], gam_prep)
+    gam_test = apply_gam_preprocessor(modeling.iloc[test_index], gam_prep)
+    gam_fit = LogisticGAM(gam_terms(), lam=0.6, max_iter=300).fit(gam_train, y_train)
+    oof.loc[test_index, "GAM"] = gam_fit.predict_proba(gam_test)
+
+    forest_search = GridSearchCV(
+        make_forest_pipeline(), FOREST_GRID, scoring="neg_brier_score",
+        cv=inner_cv, n_jobs=-1, refit=True,
+    ).fit(X_train, y_train)
+    oof.loc[test_index, "Random forest"] = forest_search.predict_proba(X_test)[:, 1]
+    forest_outer.append({
+        "Fold": fold, "max_features": forest_search.best_params_["model__max_features"],
+        "min_samples_leaf": forest_search.best_params_["model__min_samples_leaf"],
+        "Inner mean Brier score": -forest_search.best_score_,
+    })
+assert oof[["LASSO", "GAM", "Random forest"]].notna().all().all()
+```
+
+```{python}
+#| label: fit-final-models
+full_inner_cv = StratifiedKFold(n_splits=OUTER_K, shuffle=True, random_state=SEED)
+final_lasso_search = GridSearchCV(
+    make_lasso_pipeline(), {"model__C": C_GRID}, scoring="neg_brier_score",
+    cv=full_inner_cv, n_jobs=-1, refit=True,
+).fit(X, y)
+final_lasso = final_lasso_search.best_estimator_
+final_gam_prep = fit_gam_preprocessor(modeling)
+final_gam_X = apply_gam_preprocessor(modeling, final_gam_prep)
+final_gam = LogisticGAM(gam_terms(), lam=0.6, max_iter=300).fit(final_gam_X, y)
+final_forest_search = GridSearchCV(
+    make_forest_pipeline(), FOREST_GRID, scoring="neg_brier_score",
+    cv=full_inner_cv, n_jobs=-1, refit=True,
+).fit(X, y)
+final_forest = final_forest_search.best_estimator_
+
+all_final_names = final_lasso.named_steps["preprocess"].get_feature_names_out()
+final_names = all_final_names[final_lasso.named_steps["remove_constant"].get_support()]
+final_values = final_lasso.named_steps["model"].coef_.ravel()
+final_coefficients = pd.DataFrame({"Predictor": final_names, "Coefficient": final_values})
+final_coefficients = final_coefficients.loc[~np.isclose(final_coefficients["Coefficient"], 0)].copy()
+final_coefficients["Folds selected"] = final_coefficients["Predictor"].map(
+    lambda name: sum(name in selected for selected in lasso_selected)
+)
+final_coefficients["Absolute coefficient"] = final_coefficients["Coefficient"].abs()
+final_coefficients = final_coefficients.sort_values("Absolute coefficient", ascending=False)
+```
+
+```{python}
+#| label: lasso-selection-summary
+lasso_outer_table = pd.DataFrame(lasso_outer)
+display(lasso_outer_table.style.hide(axis="index").format({"C": "{:.4f}"}).set_caption(
+    "Table 4. LASSO tuning and retained predictor count by outer fold"
+))
+```
+
+Table 4 shows how the selected penalty and model size vary across folds.
+Variation is expected with correlated summaries because LASSO can substitute
+one related feature for another. Selection frequency describes stability and
+should not be interpreted as causal importance.
+
+```{python}
+#| label: lasso-coefficients
+#| fig-width: 8
+#| fig-height: 8
+coefficient_plot = final_coefficients.head(30).sort_values("Coefficient")
+colors = np.where(coefficient_plot["Coefficient"].gt(0), "#b33b2e", "#2b6f9e")
+fig, ax = plt.subplots(figsize=(8, 8))
+ax.barh(coefficient_plot["Predictor"], coefficient_plot["Coefficient"], color=colors)
+ax.axvline(0, color="grey", linewidth=.8)
+ax.set(title="Largest standardized coefficients in the final LASSO model",
+       xlabel="Log-odds coefficient", ylabel="")
+plt.tight_layout(); plt.show()
+```
+
+Figure 1 compares numeric predictors after standardization and categorical
+indicator changes on their encoded scale. Positive coefficients correspond to
+higher modeled mortality risk and negative coefficients to lower risk,
+conditional on other retained predictors; the associations are not causal.
+
+```{python}
+#| label: lasso-kept-table
+display(final_coefficients[["Predictor", "Coefficient", "Folds selected"]]
+        .style.hide(axis="index").format({"Coefficient": "{:.4f}"})
+        .set_caption("Table 5. Predictors retained by the final LASSO and outer-fold stability"))
+```
+
+Table 5 lists every predictor retained after refitting on all Set A. Features
+selected in all five outer fits are more stable than those selected in only
+one, although correlated features can lower apparent stability.
+
+# 2.5 Model 2: non-linear effects with a GAM
+
+Model 2 is a logistic generalized additive model (GAM). Twelve continuous
+predictors were selected before fitting on clinical grounds to represent age,
+vital signs, neurologic status, renal function, acid-base status, urine output,
+and inflammation. Mechanical ventilation, sex, and ICU type enter as linear or
+categorical indicator terms. Four basis functions per smooth and a fixed
+smoothing penalty of 0.6 limit flexibility without using held-out outcomes.
+
+```{python}
+#| label: gam-predictor-table
+gam_predictor_table = pd.DataFrame({
+    "Predictor": gam_continuous + gam_linear + gam_categories,
+    "Role": ["Smooth continuous effect"] * len(gam_continuous)
+            + ["Linear binary effect"] + ["Categorical effect"] * 2,
+})
+display(gam_predictor_table.style.hide(axis="index").set_caption(
+    "Table 6. Fifteen clinically selected GAM predictors"
+))
+```
+
+The restricted set makes the GAM interpretable and reduces unstable smooths.
+The choices were fixed before examining outer-fold performance.
+
+```{python}
+#| label: gam-partial-effects
+#| fig-width: 8
+#| fig-height: 3.2
+partial_variables = [
+    ("HR_mean", "Mean heart rate (beats/min)"),
+    ("Temp_mean", "Mean temperature (degrees C)"),
+    ("Creatinine_last", "Last creatinine (mg/dL)"),
+]
+partial_rows, shape_rows = [], []
+for variable, label in partial_variables:
+    term_index = gam_continuous.index(variable)
+    observed = modeling[variable].dropna()
+    raw_grid = np.linspace(observed.quantile(.05), observed.quantile(.95), 100)
+    reference_raw = observed.median()
+    mean = final_gam_prep["continuous_scaler"].mean_[term_index]
+    scale = final_gam_prep["continuous_scaler"].scale_[term_index]
+    reference = np.nanmedian(final_gam_X, axis=0)
+    grid_matrix = np.tile(reference, (len(raw_grid), 1))
+    grid_matrix[:, term_index] = (raw_grid - mean) / scale
+    reference_matrix = reference.reshape(1, -1).copy()
+    reference_matrix[0, term_index] = (reference_raw - mean) / scale
+    effect, interval = final_gam.partial_dependence(term=term_index, X=grid_matrix, width=.95)
+    reference_effect = float(final_gam.partial_dependence(term=term_index, X=reference_matrix)[0])
+    odds_ratio = np.exp(effect - reference_effect)
+    partial_rows.append(pd.DataFrame({
+        "variable": variable, "label": label, "value": raw_grid,
+        "odds_ratio": odds_ratio, "lower": np.exp(interval[:, 0] - reference_effect),
+        "upper": np.exp(interval[:, 1] - reference_effect),
+    }))
+    coef_indices = final_gam.terms.get_coef_indices(term_index)
+    edf = float(final_gam.statistics_["edof_per_coef"][coef_indices].sum())
+    left, middle, right = odds_ratio[0], odds_ratio[len(odds_ratio)//2], odds_ratio[-1]
+    if edf < 1.3:
+        direction = "increasing" if right > left else "decreasing"
+        shape = f"approximately linear and {direction}"
+    elif left > middle and right > middle:
+        shape = "curved, with higher estimated risk at both low and high values"
+    elif right > left:
+        shape = "curved, with estimated risk generally increasing across the range"
+    else:
+        shape = "curved, with estimated risk generally decreasing across the range"
+    shape_rows.append({"Predictor": label, "EDF": edf, "Assessment": shape})
+
+partial_effects = pd.concat(partial_rows, ignore_index=True)
+fig, axes = plt.subplots(1, 3, figsize=(8, 3.2))
+for ax, (variable, label) in zip(axes, partial_variables):
+    values = partial_effects.loc[partial_effects["variable"].eq(variable)]
+    ax.fill_between(values["value"], values["lower"], values["upper"], color="#8ab6d6", alpha=.35)
+    ax.plot(values["value"], values["odds_ratio"], color="#235f87")
+    ax.axhline(1, linestyle="--", color="grey", linewidth=.8)
+    ax.set_title(label); ax.set_xlabel("")
+axes[0].set_ylabel("Odds ratio relative to median")
+fig.suptitle("Adjusted GAM partial effects with pointwise 95% confidence bands", y=1.03)
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| label: gam-shape-summary
+shape_table = pd.DataFrame(shape_rows)
+display(shape_table.style.hide(axis="index").format({"EDF": "{:.2f}"}).set_caption(
+    "Table 7. Shape assessment for the plotted GAM effects"
+))
+clinical_text = {
+    "Mean heart rate (beats/min)": "The increasing pattern is clinically plausible because tachycardia can reflect physiologic stress.",
+    "Mean temperature (degrees C)": "The decreasing pattern suggests higher risk at lower temperatures, which is plausible for severe hypothermia; it does not show a U-shape over the central observed range.",
+    "Last creatinine (mg/dL)": "The nearly flat, slightly decreasing pattern does not match the usual expectation that renal dysfunction raises risk, so it should not receive a strong clinical interpretation after multivariable adjustment.",
+}
+sentences = [f"- **{row['Predictor']}** is {row['Assessment']} (EDF {row['EDF']:.2f}). {clinical_text[row['Predictor']]}" for row in shape_rows]
+display(Markdown("\n".join(sentences)))
+```
+
+Figure 2 and Table 7 describe the adjusted shape of each selected predictor.
+Confidence bands widen where observations are sparse, so curve ends should be
+interpreted cautiously.
+
+# 2.6 Model 3: tree ensemble
+
+Model 3 is a probability random forest using all candidate predictors. The
+nested search compares `sqrt(p)` with 50% of features at each split and minimum
+leaf sizes of 5 and 20, using 250 trees per fit. Missing values are
+median-imputed within each training split. No early stopping is used.
+
+```{python}
+#| label: forest-tuning-table
+forest_choices = pd.DataFrame(forest_outer)
+display(forest_choices.style.hide(axis="index").format({"Inner mean Brier score": "{:.4f}"})
+        .set_caption("Table 8. Random-forest settings chosen by nested tuning"))
+```
+
+Table 8 shows whether tuning consistently favors the same feature sampling and
+terminal-node regularization across outer folds.
+
+# 2.7 Comparison and choice of final model
+
+```{python}
+#| label: comparison-table
+fold_rows = []
+for model_name in model_names:
+    for fold in range(1, OUTER_K + 1):
+        mask = oof["fold"].eq(fold) & oof[model_name].notna()
+        fold_rows.append({"Model": model_name, "Fold": fold,
+                          "AUROC": roc_auc_score(oof.loc[mask, "outcome"], oof.loc[mask, model_name])})
+fold_auc = pd.DataFrame(fold_rows)
+auc_summary = (fold_auc.groupby("Model")["AUROC"].agg(**{"Mean AUROC": "mean", "SD AUROC": "std"}).reset_index())
+comparison_table = (
+    fold_auc.pivot(index="Model", columns="Fold", values="AUROC")
+    .rename(columns=lambda value: f"Fold {value}").reset_index()
+    .merge(auc_summary, on="Model").sort_values("Mean AUROC", ascending=False)
+)
+display(comparison_table.style.hide(axis="index").format(
+    {column: "{:.3f}" for column in comparison_table.columns if column != "Model"})
+    .set_caption("Table 9. Outer-fold AUROC for three models and two benchmarks"))
+```
+
+Table 9 compares every approach on the same held-out stays. Fold-to-fold
+variation provides context for whether a small mean AUROC difference is
+meaningful.
+
+```{python}
+#| label: roc-curves
+#| fig-width: 8
+#| fig-height: 6
+fig, ax = plt.subplots(figsize=(8, 6))
+for model_name in model_names:
+    mask = oof[model_name].notna()
+    fpr, tpr, _ = roc_curve(oof.loc[mask, "outcome"], oof.loc[mask, model_name])
+    pooled_auc = roc_auc_score(oof.loc[mask, "outcome"], oof.loc[mask, model_name])
+    ax.plot(fpr, tpr, label=f"{model_name} ({pooled_auc:.3f})")
+ax.plot([0, 1], [0, 1], linestyle="--", color="grey")
+ax.set(xlabel="False-positive rate", ylabel="True-positive rate",
+       title="Out-of-fold receiver operating characteristic curves")
+ax.legend(title="Pooled AUROC", loc="lower right")
+plt.tight_layout(); plt.show()
+```
+
+Figure 3 shows discrimination over all thresholds. Curves closer to the upper
+left rank deaths above survivors more consistently; overlap indicates similar
+discrimination.
+
+```{python}
+#| label: choose-and-save-final-model
+candidate_summary = auc_summary.loc[auc_summary["Model"].isin(["LASSO", "GAM", "Random forest"])].sort_values("Mean AUROC", ascending=False)
+benchmark_summary = auc_summary.loc[auc_summary["Model"].isin(["SAPS-I", "SOFA"])].sort_values("Mean AUROC", ascending=False)
+best_model, best_benchmark = candidate_summary.iloc[0], benchmark_summary.iloc[0]
+difference = best_model["Mean AUROC"] - best_benchmark["Mean AUROC"]
+benchmark_sd = best_benchmark["SD AUROC"]
+if best_model["Model"] == "LASSO":
+    final_bundle = {"model_name": "LASSO", "model": final_lasso,
+                    "feature_columns": feature_columns, "feature_window_hours": (0, 48)}
+elif best_model["Model"] == "GAM":
+    final_bundle = {"model_name": "GAM", "model": final_gam,
+                    "preprocessor": final_gam_prep, "continuous_features": gam_continuous,
+                    "linear_features": gam_linear, "categorical_features": gam_categories,
+                    "feature_window_hours": (0, 48)}
+else:
+    final_bundle = {"model_name": "Random forest", "model": final_forest,
+                    "feature_columns": feature_columns, "feature_window_hours": (0, 48)}
+joblib.dump(final_bundle, OUTPUT_DIR / "cp2_final_model.joblib")
+oof.to_csv(OUTPUT_DIR / "cp2_oof_predictions.csv", index=False)
+fold_auc.to_csv(OUTPUT_DIR / "cp2_cv_results.csv", index=False)
+variation_statement = "larger than" if difference > benchmark_sd else "not larger than"
+display(Markdown(
+    f"The best fitted model was **{best_model['Model']}** with mean AUROC **{best_model['Mean AUROC']:.3f}** "
+    f"(fold SD **{best_model['SD AUROC']:.3f}**). The stronger benchmark was **{best_benchmark['Model']}** "
+    f"with mean AUROC **{best_benchmark['Mean AUROC']:.3f}** (fold SD **{benchmark_sd:.3f}**). "
+    f"The difference of **{difference:.3f}** was **{variation_statement}** the benchmark's fold-to-fold SD. "
+    "I selected the highest mean-AUROC model and refit it on all Set A because it offered the strongest "
+    "observed discrimination; simplicity and interpretability remain relevant when differences are small."
+))
+```
+
+The saved bundle contains the fitted preprocessing required by the selected
+model. Calibration, decision curves, subgroup analyses, and SHAP-style
+explanations are deferred to Checkpoint 3 as required.
+
+# Reproducibility and saved files
+
+```{python}
+#| label: saved-output-checks
+required_outputs = ["cp2_modeling_table.csv", "cp2_oof_predictions.csv",
+                    "cp2_cv_results.csv", "cp2_final_model.joblib"]
+output_check = pd.DataFrame({"Saved file": required_outputs,
+                             "Exists": [(OUTPUT_DIR / name).exists() for name in required_outputs]})
+assert output_check["Exists"].all()
+display(output_check.style.hide(axis="index").set_caption(
+    "Table 10. Machine-readable outputs saved for Checkpoint 3"))
+elapsed_minutes = (perf_counter() - START_TIME) / 60
+display(Markdown(
+    f"The complete analysis took **{elapsed_minutes:.1f} minutes** in this run. "
+    "All random splits and stochastic models use fixed seeds. The analysis reads only from `data/`, "
+    "writes only under `output/`, and uses repository-relative paths."
+))
+```
+
+From the repository root, reproduce the report with:
+
+```text
+pixi run --locked checkpoint2
+```
+
+The rendered report is `output/checkpoint2.html`. The modeling table, final
+fitted model bundle, out-of-fold predictions, and per-fold results are saved
+under `output/` for Checkpoint 3.
+
+# Reference
+
+Silva, I., Moody, G., Scott, D. J., Celi, L. A., & Mark, R. G. (2012).
+Predicting in-hospital mortality of ICU patients: The PhysioNet/Computing in
+Cardiology Challenge 2012. *Computing in Cardiology, 39*, 245–248.
