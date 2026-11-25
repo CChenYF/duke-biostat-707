@@ -33,3 +33,4 @@ pygam = ">=0.12.0,<0.13"
 [tasks]
 checkpoint1 = "quarto render checkpoint1.qmd --output-dir output"
 checkpoint2 = "quarto render checkpoint2.qmd --output-dir output"
+checkpoint3 = "pixi run --manifest-path cp3-environment/pixi.toml --locked render"

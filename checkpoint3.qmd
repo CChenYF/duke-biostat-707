@@ -1,0 +1,848 @@
+---
+title: "BIOSTAT 707 Checkpoint 3: Evaluating the Final Model"
+author: "Yifei Chen"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: true
+    code-summary: "Show Python code"
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+  error: false
+---
+
+```{python}
+#| label: setup
+#| include: false
+from pathlib import Path
+from io import BytesIO
+import base64
+import hashlib
+import json
+import re
+import tarfile
+from time import perf_counter
+
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import shap
+import sklearn
+from IPython.display import Markdown, Image, display
+from scipy.special import logit
+from sklearn.metrics import roc_auc_score, precision_recall_curve, average_precision_score
+from statsmodels.genmod.generalized_linear_model import GLM
+from statsmodels.genmod.families import Binomial
+from statsmodels.nonparametric.smoothers_lowess import lowess
+
+ROOT = Path(".")
+OUT = ROOT / "output" / "checkpoint3"
+START_TIME = perf_counter()
+OUT.mkdir(parents=True, exist_ok=True)
+SEED, N_BOOT, CURVE_BOOT = 7073, 2000, 200
+THRESHOLD = 0.20
+THRESHOLDS = np.linspace(0.10, 0.40, 61)
+rng = np.random.default_rng(SEED)
+plt.style.use("seaborn-v0_8-whitegrid")
+pd.set_option("display.max_colwidth", 120)
+
+def show_table(frame, caption, digits=3):
+    display(frame.style.hide(axis="index").format(precision=digits, na_rep="Not estimable")
+            .set_caption(caption).set_uuid(hashlib.sha256(caption.encode()).hexdigest()[:12]))
+
+def save_figure(name):
+    plt.tight_layout()
+    plt.savefig(OUT / f"{name}.png", dpi=160, bbox_inches="tight")
+    plt.show()
+
+def risk_logit(p):
+    return logit(np.clip(np.asarray(p, float), 1e-6, 1 - 1e-6))
+
+def calibration_fits(y, p):
+    z = risk_logit(p)
+    intercept = GLM(np.asarray(y), np.ones((len(z), 1)),
+                    offset=z, family=Binomial()).fit()
+    slope = GLM(np.asarray(y), np.column_stack([np.ones(len(z)), z]),
+                family=Binomial()).fit()
+    return intercept, slope
+
+def auc_bootstrap(y, scores, n_boot=N_BOOT):
+    y, scores = np.asarray(y), np.asarray(scores)
+    aucs = []
+    for _ in range(n_boot):
+        i = rng.integers(0, len(y), len(y))
+        if np.unique(y[i]).size == 2:
+            aucs.append(roc_auc_score(y[i], scores[i]))
+    return roc_auc_score(y, scores), np.quantile(aucs, [.025, .975]), np.asarray(aucs)
+
+model_path = ROOT / "output" / "cp2_final_model.joblib"
+required = [model_path, ROOT / "output" / "cp2_modeling_table.csv",
+            ROOT / "output" / "cp2_cv_results.csv",
+            ROOT / "output" / "checkpoint2.html"]
+missing = [str(p) for p in required if not p.exists()]
+if missing:
+    raise FileNotFoundError("Missing Checkpoint 2 materials: " + ", ".join(missing))
+if sklearn.__version__ != "1.6.1":
+    raise RuntimeError("The saved Checkpoint 2 model requires scikit-learn==1.6.1. "
+                       "Use a compatible environment; do not refit or overwrite the model.")
+model_hash_before = hashlib.sha256(model_path.read_bytes()).hexdigest()
+bundle = joblib.load(model_path)
+assert bundle["model_name"] == "Random forest", "This report evaluates the saved CP2 random forest."
+model = bundle["model"]
+feature_columns = bundle["feature_columns"]
+assert list(model.feature_names_in_) == list(feature_columns)
+assert not set(feature_columns) & {
+    "RecordID", "outcome", "In-hospital_death", "SAPS-I", "SOFA",
+    "Length_of_stay", "Survival", "Survival_time",
+}, "Outcome, identifier, or benchmark leaked into model inputs."
+set_a = pd.read_csv(ROOT / "output" / "cp2_modeling_table.csv")
+cv = pd.read_csv(ROOT / "output" / "cp2_cv_results.csv")
+cv_summary = cv.groupby("Model")["AUROC"].agg(["mean", "std"])
+series_parameters = sorted(c[:-6] for c in set_a.columns if c.endswith("_count"))
+```
+
+# Artificial intelligence use statement
+
+I used OpenAI Codex to help troubleshoot a Pixi version mismatch: the locked environment used scikit-learn 1.9.1, while the saved Checkpoint 2 model required 1.6.1. It helped configure a separate CP3 environment with compatible dependencies and its own lockfile, allowing the saved model to load without changing the CP2 environment. It also helped implement the LOESS calibration curve, debug code, improve compatibility with Checkpoint 2 outputs, and organize code labels.calibration intercept, and calibration slope, and revise the report’s language and interpretations.
+
+Checks included predictor order, agreement with the saved set-a table, unchanged model files, and generated results. AI made the work more efficient, but some suggestions were overly complicated and needed correction. I remain responsible for the final analysis and interpretations.
+
+# 3.1 Applying the saved model to set-b and set-c
+
+The final model is the random forest selected in Checkpoint 2. Its saved
+pipeline includes the set-a median imputation, categorical encoding, and
+constant-column removal. No prediction model is retrained, tuned, or
+recalibrated on set-b or set-c. Each stay is represented by the same admission
+descriptors and 0–48-hour summaries used in Checkpoint 2. The Simplified Acute Physiology Score I (SAPS-I) and Sequential Organ Failure
+Assessment (SOFA) remain benchmarks and are not predictors. ICU denotes intensive
+care unit. The saved forest uses the full candidate feature set to capture
+nonlinearities and interactions. Its set-a median imputation preserves patients
+with incomplete measurements, while count and missingness features retain
+information about measurement availability; neither is re-estimated here.
+
+The following function repeats Checkpoint 2's cleaning and feature construction.
+The time-series parameter list is recovered from the saved set-a modeling table,
+so evaluation sets cannot change the feature vocabulary. The same function is
+also checked against the saved set-a table before either evaluation set is used.
+
+```{python}
+#| label: modeling-tables
+bounds = pd.DataFrame([
+    ("Age", 18, 120), ("Height", 100, 230), ("Weight", 20, 400),
+    ("HR", 20, 250), ("RespRate", 4, 60), ("Temp", 30, 43),
+    ("pH", 6.8, 7.8), ("GCS", 3, 15), ("FiO2", .20, 1),
+    ("SaO2", 50, 100), ("Gender", 0, 1), ("ICUType", 1, 4),
+], columns=["Parameter", "lower", "upper"])
+
+def build_table(directory, letter):
+    outcomes = pd.read_csv(directory / f"Outcomes-{letter}.txt")[
+        ["RecordID", "SAPS-I", "SOFA", "In-hospital_death"]].copy()
+    records = []
+
+    def read_one(source, record_id):
+        frame = pd.read_csv(source)
+        assert list(frame.columns) == ["Time", "Parameter", "Value"]
+        embedded = frame.loc[frame["Parameter"].eq("RecordID"), "Value"]
+        assert len(embedded) == 1 and int(embedded.iloc[0]) == record_id
+        frame["RecordID"] = record_id
+        records.append(frame)
+
+    files = sorted((directory / f"set-{letter}").glob("*.txt"), key=lambda p: int(p.stem))
+    if files:
+        for path in files:
+            read_one(path, int(path.stem))
+    else:
+        archive = directory / f"set-{letter}.tar.gz"
+        if not archive.exists():
+            raise FileNotFoundError(f"Need set-{letter}/ or {archive.name} in {directory}")
+        with tarfile.open(archive, "r|gz") as tar:
+            for member in tar:
+                if (member.isfile() and Path(member.name).suffix == ".txt"
+                        and Path(member.name).stem.isdigit()):
+                    read_one(BytesIO(tar.extractfile(member).read()), int(Path(member.name).stem))
+    assert len(records) == len(outcomes) == 4000
+    assert outcomes.RecordID.is_unique
+    assert set(outcomes["In-hospital_death"].unique()) <= {0, 1}
+    long_raw = pd.concat(records, ignore_index=True)
+    assert set(long_raw.RecordID.unique()) == set(outcomes.RecordID)
+    long_raw = long_raw.loc[~long_raw.Parameter.eq("RecordID")].copy()
+    time_parts = long_raw.Time.str.split(":", expand=True).astype(float)
+    long_raw["hour"] = time_parts[0] + time_parts[1] / 60
+    long_raw["Value_raw"] = pd.to_numeric(long_raw.Value, errors="coerce")
+    long_raw = long_raw[["RecordID", "hour", "Parameter", "Value_raw"]]
+    assert long_raw.hour.between(0, 48).all()
+    long = long_raw.merge(bounds, on="Parameter", how="left")
+    long["negative_invalid"] = long.Value_raw.lt(0)
+    long["outside_screen"] = (long.lower.notna()
+        & (long.Value_raw.lt(long.lower) | long.Value_raw.gt(long.upper))
+        & ~long.negative_invalid)
+    long["Value"] = long.Value_raw.mask(long.negative_invalid | long.outside_screen)
+    static_parameters = ["Age", "Gender", "Height", "ICUType", "Weight"]
+    static = (long.loc[long.hour.eq(0) & long.Parameter.isin(static_parameters)]
+        .sort_values(["RecordID", "Parameter", "hour"])
+        .drop_duplicates(["RecordID", "Parameter"], keep="first")
+        .pivot(index="RecordID", columns="Parameter", values="Value")
+        .rename(columns={"Weight": "Weight_admission"}))
+    series = long.loc[long.Parameter.isin(series_parameters)].copy()
+    series = series.sort_values(["RecordID", "Parameter", "hour"])
+    valid = series.dropna(subset=["Value"]).copy()
+    valid["time_value"] = valid.hour * valid.Value
+    valid["time_squared"] = valid.hour ** 2
+    summary = valid.groupby(["RecordID", "Parameter"]).agg(
+        count=("Value", "size"), last=("Value", "last"),
+        minimum=("Value", "min"), maximum=("Value", "max"), mean=("Value", "mean"),
+        sum_time=("hour", "sum"), sum_value=("Value", "sum"),
+        sum_time_value=("time_value", "sum"), sum_time_squared=("time_squared", "sum"))
+    denominator = summary["count"] * summary.sum_time_squared - summary.sum_time ** 2
+    summary["slope"] = (summary["count"] * summary.sum_time_value
+                        - summary.sum_time * summary.sum_value) / denominator.replace(0, np.nan)
+    summary = summary[["count", "last", "minimum", "maximum", "mean", "slope"]]
+    index = pd.MultiIndex.from_product([outcomes.RecordID, series_parameters],
+                                       names=["RecordID", "Parameter"])
+    summary = summary.reindex(index)
+    summary["count"] = summary["count"].fillna(0).astype(int)
+    summary["never"] = summary["count"].eq(0).astype(int)
+    wide = summary.unstack("Parameter")
+    wide.columns = [f"{parameter}_{stat}" for stat, parameter in wide.columns]
+    table = (outcomes[["RecordID"]].set_index("RecordID")
+        .join(static, how="left").join(wide, how="left")
+        .join(outcomes.set_index("RecordID")[["SAPS-I", "SOFA", "In-hospital_death"]])
+        .reset_index())
+    table[["SAPS-I", "SOFA"]] = table[["SAPS-I", "SOFA"]].replace(-1, np.nan)
+    table["outcome"] = table.pop("In-hospital_death").astype(int)
+    for name in ["Height", "Weight_admission", "Age"]:
+        table[f"{name}_missing"] = table[name].isna().astype(int)
+    table["Gender"] = table.Gender.map({0: "Female", 1: "Male"}).fillna("Unknown")
+    table["ICUType"] = table.ICUType.map({1: "Coronary care", 2: "Cardiac surgery recovery",
+        3: "Medical ICU", 4: "Surgical ICU"}).fillna("Unknown")
+    assert table.RecordID.is_unique and table.outcome.notna().all()
+    assert set(feature_columns) <= set(table.columns)
+    return table, long
+
+rebuilt_a, _ = build_table(ROOT / "data", "a")
+pd.testing.assert_frame_equal(
+    rebuilt_a[set_a.columns].sort_values("RecordID").reset_index(drop=True),
+    set_a.sort_values("RecordID").reset_index(drop=True),
+    check_dtype=False, check_exact=False, rtol=1e-9, atol=1e-9)
+del rebuilt_a, _
+
+external_directory = ROOT / "data"
+tables, raw_tables = {}, {}
+for letter in ["b", "c"]:
+    table, raw = build_table(external_directory, letter)
+    assert set(table.RecordID).isdisjoint(set_a.RecordID)
+    table["predicted_risk"] = model.predict_proba(table[feature_columns])[:, 1]
+    assert np.isfinite(table.predicted_risk).all() and table.predicted_risk.between(0, 1).all()
+    tables[letter], raw_tables[letter] = table, raw
+    table.to_csv(OUT / f"set_{letter}_predictions.csv", index=False)
+assert set(tables["b"].RecordID).isdisjoint(tables["c"].RecordID)
+cohort = pd.DataFrame([{"Set": f"set-{k}", "Stays": len(t), "Deaths": int(t.outcome.sum()),
+                        "Death rate": t.outcome.mean()} for k, t in tables.items()])
+show_table(cohort, "Evaluation cohorts")
+for row in cohort.to_dict("records"):
+    display(Markdown(f"Table 1 shows **{row['Stays']:,} stays and {row['Deaths']:,} deaths** "
+        f"in {row['Set']} ({row['Death rate']:.1%}); deaths are a minority in this cohort."))
+display(Markdown(f"Feature construction reproduced the saved set-a table. "
+                 f"The frozen pipeline receives {len(feature_columns)} predictors in their saved order."))
+```
+
+# 3.2 Discrimination
+
+Area under the receiver operating characteristic curve (AUROC) measures
+ranking discrimination. Intervals use 2,000 bootstrap resamples of stays, keeping the prediction
+model fixed. SAPS-I and SOFA use their original scores for AUROC. Comparisons
+with the model additionally use the same complete-score stays; missing scores
+are not silently imputed for discrimination.
+
+```{python}
+#| label: discrimination
+auc_rows, auc_draws = [], {}
+for letter, table in tables.items():
+    for name, column in [("Random forest", "predicted_risk"), ("SAPS-I", "SAPS-I"), ("SOFA", "SOFA")]:
+        selected = table.loc[table[column].notna()]
+        value, interval, draws = auc_bootstrap(selected.outcome, selected[column])
+        auc_rows.append({"Set": f"set-{letter}", "Model": name, "Stays": len(selected),
+            "Deaths": int(selected.outcome.sum()), "AUROC": value,
+            "95% CI lower": interval[0], "95% CI upper": interval[1]})
+        if name == "Random forest":
+            auc_draws[letter] = draws
+auc_table = pd.DataFrame(auc_rows)
+show_table(auc_table, "External AUROC and bootstrap 95% confidence intervals")
+auc_table.to_csv(OUT / "auroc.csv", index=False)
+display(Markdown("Table 2 reports uncertainty for both external cohorts; Table 3 compares "
+    "these estimates with cross-validation (CV) means and fold standard deviations (SDs). "
+    "A fold SD describes variation across the five folds, rather than a 95% confidence interval (CI)."))
+comparison = cv_summary.reset_index().rename(columns={"mean": "CP2 CV mean", "std": "CP2 CV SD"})
+comparison = comparison.loc[comparison.Model.isin(["Random forest", "SAPS-I", "SOFA"])]
+for letter in ["b", "c"]:
+    values = auc_table.loc[auc_table.Set.eq(f"set-{letter}")].set_index("Model")
+    comparison[f"set-{letter} AUROC (95% CI)"] = comparison.Model.map(lambda name:
+        f"{values.loc[name, 'AUROC']:.3f} ({values.loc[name, '95% CI lower']:.3f}–"
+        f"{values.loc[name, '95% CI upper']:.3f})")
+show_table(comparison, "Checkpoint 2 CV versus external performance")
+matched_rows = []
+for letter, table in tables.items():
+    for score in ["SAPS-I", "SOFA"]:
+        mask = table[score].notna()
+        matched_rows.append({"Set": f"set-{letter}", "Benchmark": score, "Matched stays": int(mask.sum()),
+            "Model AUROC": roc_auc_score(table.loc[mask, "outcome"], table.loc[mask, "predicted_risk"]),
+            "Benchmark AUROC": roc_auc_score(table.loc[mask, "outcome"], table.loc[mask, score])})
+matched = pd.DataFrame(matched_rows)
+show_table(matched, "Model and benchmark on identical stays")
+for row in matched.to_dict("records"):
+    gap = row["Model AUROC"] - row["Benchmark AUROC"]
+    display(Markdown(f"In Table 4, the model-minus-{row['Benchmark']} AUROC difference on "
+        f"{row['Set']} is {gap:+.3f} using the same {row['Matched stays']:,} stays. "
+        "This avoids attributing a difference in patient availability to the model."))
+model_aucs = auc_table.loc[auc_table.Model.eq("Random forest")].set_index("Set")
+cv_mean = cv_summary.loc["Random forest", "mean"]
+for letter in ["b", "c"]:
+    external_auc = model_aucs.loc[f"set-{letter}", "AUROC"]
+    direction = "higher" if cv_mean > external_auc else "lower"
+    display(Markdown(f"The CV mean ({cv_mean:.3f}) was {direction} than the set-{letter} AUROC "
+        f"({external_auc:.3f}) by {abs(cv_mean - external_auc):.3f}. "
+        + ("This suggests an optimistic CV estimate for this cohort, although sampling and case-mix differences also matter."
+           if cv_mean > external_auc else "There is no observed drop in AUROC for this cohort.")))
+n = min(len(auc_draws["b"]), len(auc_draws["c"]))
+difference_draws = auc_draws["b"][:n] - auc_draws["c"][:n]
+diff_ci = np.quantile(difference_draws, [.025, .975])
+diff = model_aucs.loc["set-b", "AUROC"] - model_aucs.loc["set-c", "AUROC"]
+chance_text = ("The interval includes zero, so the observed difference is compatible with sampling variation."
+               if diff_ci[0] <= 0 <= diff_ci[1] else
+               "The interval excludes zero, suggesting a difference beyond sampling variation; this does not identify its cause.")
+display(Markdown(f"Set-b minus set-c AUROC was **{diff:.4f}** (independent-cohort bootstrap 95% CI "
+                 f"{diff_ci[0]:.3f} to {diff_ci[1]:.3f}). {chance_text}"))
+
+b = tables["b"]
+precision, recall, _ = precision_recall_curve(b.outcome, b.predicted_risk)
+ap = average_precision_score(b.outcome, b.predicted_risk)
+fig, ax = plt.subplots(figsize=(7, 4.5))
+ax.step(recall, precision, where="post", label=f"Random forest; average precision = {ap:.3f}")
+ax.axhline(b.outcome.mean(), color="gray", linestyle="--", label=f"Death rate = {b.outcome.mean():.1%}")
+ax.set(xlabel="Recall (sensitivity)", ylabel="Precision (positive predictive value)",
+       title="Figure 1. Precision-recall curve on set-b", xlim=(0, 1), ylim=(0, 1))
+ax.legend()
+save_figure("precision_recall")
+display(Markdown(f"Figure 1 has average precision **{ap:.3f}**, compared with the "
+    f"death-rate baseline of **{b.outcome.mean():.3f}**. "
+    "The curve quantifies the false-alarm burden as more deaths are identified."))
+```
+
+Deaths are a minority, so a small false-positive rate can still produce many
+false alarms among survivors. The precision-recall curve shows how many flagged
+patients actually die at different levels of sensitivity. Its baseline is the
+observed death rate, rather than the ROC diagonal.
+
+# 3.3 Calibration
+
+Calibration-in-the-large uses an offset regression with slope fixed at 1.
+The calibration slope comes from a separate regression that estimates both an
+intercept and slope. These are diagnostic fits; predictions remain unchanged.
+The flexible curves use locally estimated scatterplot smoothing (LOESS) with span 0.4, no robust iterations for binary
+outcomes, and pointwise percentile confidence bands from 200 bootstrap samples.
+Rugs show where the predictions are concentrated. Curves are restricted to the
+central 98% of predictions to avoid extending a smoother into almost empty tails.
+
+```{python}
+#| label: calibration
+cal_rows = []
+fig, axes = plt.subplots(1, 2, figsize=(10, 4.5), sharex=True, sharey=True)
+for ax, (letter, table) in zip(axes, tables.items()):
+    y, p = table.outcome.to_numpy(), table.predicted_risk.to_numpy()
+    intercept_fit, slope_fit = calibration_fits(y, p)
+    a, slope = float(intercept_fit.params[0]), float(slope_fit.params[1])
+    a_ci, s_ci = np.asarray(intercept_fit.conf_int())[0], np.asarray(slope_fit.conf_int())[1]
+    brier = np.mean((y - p) ** 2)
+    scaled = 1 - brier / (y.mean() * (1 - y.mean()))
+    cal_rows.append({"Set": f"set-{letter}", "Intercept": a,
+        "Intercept CI lower": a_ci[0], "Intercept CI upper": a_ci[1],
+        "Slope": slope, "Slope CI lower": s_ci[0], "Slope CI upper": s_ci[1],
+        "Brier": brier, "Scaled Brier": scaled})
+    grid = np.linspace(*np.quantile(p, [.01, .99]), 150)
+
+    def smooth_on_grid(yy, pp):
+        fitted = lowess(yy, pp, frac=.4, it=0, delta=.005, return_sorted=True)
+        return np.interp(grid, fitted[:, 0], fitted[:, 1])
+
+    curve = smooth_on_grid(y, p)
+    curves = []
+    for _ in range(CURVE_BOOT):
+        i = rng.integers(0, len(y), len(y))
+        curves.append(smooth_on_grid(y[i], p[i]))
+    lower, upper = np.quantile(curves, [.025, .975], axis=0)
+    ax.fill_between(grid, np.clip(lower, 0, 1), np.clip(upper, 0, 1), alpha=.22)
+    ax.plot(grid, np.clip(curve, 0, 1), label="LOESS calibration")
+    ax.plot([0, 1], [0, 1], "--", color="gray", label="Ideal")
+    ax.plot(p, np.full(len(p), -.025), "|", alpha=.12, color="black", clip_on=False)
+    ax.set(title=f"Figure 2. Calibration, set-{letter}", xlabel="Predicted mortality risk", xlim=(0, 1), ylim=(-.05, 1))
+    bands = pd.cut(p, [-.001, .10, .20, .40, 1.001], labels=["0–10%", "10–20%", "20–40%", "40–100%"])
+    band_table = (pd.DataFrame({"Risk band": bands, "Observed": y, "Predicted": p})
+        .groupby("Risk band", observed=False).agg(Stays=("Observed", "size"),
+            Deaths=("Observed", "sum"), Observed=("Observed", "mean"), Predicted=("Predicted", "mean"))
+        .reset_index())
+    show_table(band_table, f"Calibration context by risk range, set-{letter}; supplements the LOESS curve")
+    reliable = band_table.loc[band_table.Stays.ge(50)].copy()
+    reliable["gap"] = reliable.Observed - reliable.Predicted
+    worst = reliable.loc[reliable.gap.abs().idxmax()]
+    bias = "underpredicts" if a > 0 else "overpredicts"
+    spread = "too extreme" if slope < 1 else "too compressed"
+    display(Markdown(f"On set-{letter}, the intercept is **{a:.3f}** and the slope is **{slope:.3f}**. "
+        f"The model {bias} mortality overall and its risk spread is {spread} relative to the ideal slope of 1. "
+        f"Among bands with at least 50 stays, the largest observed-minus-predicted gap is in the "
+        f"**{worst['Risk band']}** range: {worst.Observed:.1%} observed versus {worst.Predicted:.1%} predicted. "
+        "The LOESS curve shows whether this pattern varies within a band; sparse tails and wide confidence bands limit conclusions."))
+axes[0].set_ylabel("Observed mortality (smoothed)")
+axes[1].legend(loc="upper left")
+save_figure("calibration")
+calibration_table = pd.DataFrame(cal_rows)
+show_table(calibration_table, "Calibration and Brier scores; regression-based 95% CIs")
+for row in calibration_table.to_dict("records"):
+    display(Markdown(f"Table 7 gives a Brier score of **{row['Brier']:.3f}** and a scaled "
+        f"Brier score of **{row['Scaled Brier']:.3f}** on {row['Set']}. "
+        + ("The positive scaled score improves on the constant observed-death-rate reference."
+           if row['Scaled Brier'] > 0 else "The score does not improve on the constant observed-death-rate reference.")))
+calibration_table.to_csv(OUT / "calibration.csv", index=False)
+```
+
+Brier score is the mean squared difference between the observed outcome and
+predicted probability; lower is better. Scaled Brier is
+`1 - Brier / [death_rate * (1 - death_rate)]`, using each evaluation set's death
+rate. Zero corresponds to predicting that rate for everybody, one is perfect,
+and negative values are worse than the constant-risk reference. Hosmer-Lemeshow
+is not used.
+
+# 3.4 Clinical usefulness
+
+The proposed use is to flag a patient for clinician review for a possible
+goals-of-care conversation after the first 48 hours, using a **20% predicted
+mortality threshold**. This is an illustrative operating policy, not a clinically
+validated cutoff. The **10%–40%** decision-curve analysis (DCA) range and 20% threshold are
+kept fixed during this evaluation; no search over set-b/c operating thresholds
+is used to select the policy. At 20%, the net-benefit calculation gives
+one unnecessary flag a weight of 0.25 relative to one true-positive flag.
+
+SOFA is an integer score, not a mortality probability. For the decision curve
+only, a logistic score-to-risk mapping is fitted on set-a outcomes and frozen
+before being applied to set-b and set-c. Missing SOFA scores receive the set-a
+median. This is a separate benchmark mapping, not refitting the final model.
+SAPS-I and SOFA AUROC above use the original observed scores.
+
+```{python}
+#| label: clinical-usefulness
+sofa_median = set_a.SOFA.median()
+sofa_map = GLM(set_a.outcome.to_numpy(),
+    np.column_stack([np.ones(len(set_a)), set_a.SOFA.fillna(sofa_median)]), family=Binomial()).fit()
+
+def net_benefit(y, p, threshold):
+    y, p = np.asarray(y), np.asarray(p)
+    flag = p >= threshold
+    return np.mean(flag & (y == 1)) - np.mean(flag & (y == 0)) * threshold / (1 - threshold)
+
+def threshold_measures(y, p, threshold=THRESHOLD):
+    y, p = np.asarray(y), np.asarray(p)
+    flag = p >= threshold
+    tp = int(np.sum(flag & (y == 1)))
+    sensitivity = tp / np.sum(y == 1)
+    ppv = tp / flag.sum() if flag.any() else np.nan
+    return {"Sensitivity": sensitivity, "PPV": ppv,
+            "Flagged per 100": 100 * flag.mean(),
+            "Event 1 score": min(sensitivity, ppv) if np.isfinite(ppv) else np.nan}
+
+dca_rows, operating_rows = [], []
+fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
+for ax, (letter, table) in zip(axes, tables.items()):
+    table["SOFA_risk"] = sofa_map.predict(np.column_stack([
+        np.ones(len(table)), table.SOFA.fillna(sofa_median)]))
+    risks = {"Random forest": table.predicted_risk.to_numpy(), "SOFA": table.SOFA_risk.to_numpy(),
+             "Treat all": np.ones(len(table)), "Treat none": np.zeros(len(table))}
+    for name, p in risks.items():
+        benefits = [net_benefit(table.outcome, p, t) for t in THRESHOLDS]
+        ax.plot(THRESHOLDS, benefits, label=name, linestyle="--" if "Treat" in name else "-")
+        dca_rows.extend([{"Set": f"set-{letter}", "Strategy": name, "Threshold": t, "Net benefit": nb}
+                         for t, nb in zip(THRESHOLDS, benefits)])
+    ax.axvline(THRESHOLD, color="gray", linewidth=.8, linestyle=":")
+    ax.set(title=f"Figure 3. Decision curves, set-{letter}", xlabel="Risk threshold")
+    operating_rows.append({"Set": f"set-{letter}", "Threshold": THRESHOLD,
+        **threshold_measures(table.outcome, table.predicted_risk),
+        "Missing SOFA": int(table.SOFA.isna().sum())})
+axes[0].set_ylabel("Net benefit per patient")
+axes[1].legend()
+save_figure("decision_curves")
+dca = pd.DataFrame(dca_rows)
+operating = pd.DataFrame(operating_rows)
+show_table(operating, "Frozen model at the fixed 20% threshold")
+for row in operating.to_dict("records"):
+    display(Markdown(f"Table 8 shows that on {row['Set']}, the 20% rule flags "
+        f"{row['Flagged per 100']:.1f} per 100 patients, with sensitivity {row['Sensitivity']:.1%} "
+        f"and positive predictive value (PPV) {row['PPV']:.1%}. "
+        f"The Challenge 2012 event 1 score, min(sensitivity, PPV), is {row['Event 1 score']:.3f}."))
+dca.to_csv(OUT / "decision_curves.csv", index=False)
+operating.to_csv(OUT / "threshold_performance.csv", index=False)
+for letter, table in tables.items():
+    values = {"model": net_benefit(table.outcome, table.predicted_risk, THRESHOLD),
+        "SOFA": net_benefit(table.outcome, table.SOFA_risk, THRESHOLD),
+        "all": net_benefit(table.outcome, np.ones(len(table)), THRESHOLD), "none": 0.0}
+    display(Markdown(f"At 20% on set-{letter}, net benefit is **{values['model']:.3f}** for the model, "
+        f"{values['SOFA']:.3f} for SOFA, {values['all']:.3f} for treat all, and 0 for treat none. "
+        + ("The model exceeds both default strategies at this threshold."
+           if values['model'] > max(values['all'], 0) else
+           "The model does not exceed both default strategies at this threshold.")))
+```
+
+# 3.5 Subgroups on set-b
+
+Age bands are fixed at 18–44, 45–64, and 65 years or older. Sex and ICU type
+retain the Checkpoint 2 categories, including Unknown. Each estimate uses the
+unchanged model's predictions. AUROC intervals use 500 bootstrap resamples;
+calibration-in-the-large uses an offset regression with its 95% confidence
+interval. Groups without both outcomes cannot support AUROC or a finite
+calibration intercept.
+
+```{python}
+#| label: subgroups
+b = tables["b"].copy()
+b["Age group"] = pd.cut(b.Age, [17, 44, 64, np.inf], labels=["18–44", "45–64", "65+"]).astype("object").fillna("Unknown")
+subgroup_rows = []
+for group_variable in ["Age group", "Gender", "ICUType"]:
+    for group, part in b.groupby(group_variable, observed=True):
+        row = {"Grouping": group_variable, "Subgroup": str(group), "Stays": len(part),
+               "Deaths": int(part.outcome.sum()), "Death rate": part.outcome.mean(),
+               "Mean predicted risk": part.predicted_risk.mean(), "AUROC": np.nan,
+               "AUC CI lower": np.nan, "AUC CI upper": np.nan, "Calibration intercept": np.nan,
+               "Intercept CI lower": np.nan, "Intercept CI upper": np.nan}
+        if part.outcome.nunique() == 2:
+            auc, interval, _ = auc_bootstrap(part.outcome, part.predicted_risk, n_boot=500)
+            fit = GLM(part.outcome.to_numpy(), np.ones((len(part), 1)),
+                      offset=risk_logit(part.predicted_risk), family=Binomial()).fit()
+            ci_a = np.asarray(fit.conf_int())[0]
+            row.update({"AUROC": auc, "AUC CI lower": interval[0], "AUC CI upper": interval[1],
+                "Calibration intercept": float(fit.params[0]),
+                "Intercept CI lower": ci_a[0], "Intercept CI upper": ci_a[1]})
+        subgroup_rows.append(row)
+subgroups = pd.DataFrame(subgroup_rows)
+show_table(subgroups, "Set-b discrimination and calibration by subgroup")
+subgroups.to_csv(OUT / "subgroups.csv", index=False)
+for variable in ["Age group", "Gender", "ICUType"]:
+    group = subgroups.loc[subgroups.Grouping.eq(variable) & subgroups.Deaths.ge(20)
+                          & (subgroups.Stays - subgroups.Deaths).ge(20)].dropna(subset=["AUROC"])
+    if len(group) >= 2:
+        low, high = group.loc[group.AUROC.idxmin()], group.loc[group.AUROC.idxmax()]
+        display(Markdown(f"For {variable}, among groups with at least 20 deaths and 20 survivors, "
+            f"AUROC ranges from {low.AUROC:.3f} ({low.Subgroup}) to {high.AUROC:.3f} ({high.Subgroup}), "
+            f"a difference of {high.AUROC - low.AUROC:.3f}."))
+subgroups["Absolute risk gap"] = (subgroups["Mean predicted risk"] - subgroups["Death rate"]).abs()
+eligible = subgroups.loc[subgroups.Stays.ge(100) & subgroups.Deaths.ge(20)]
+if not eligible.empty:
+    largest = eligible.loc[eligible["Absolute risk gap"].idxmax()]
+    display(Markdown(f"The largest absolute mean-risk gap among groups with at least 100 stays and "
+        f"20 deaths is {largest['Absolute risk gap']:.1%} in {largest.Subgroup} "
+        f"({largest.Stays} stays, {largest.Deaths} deaths). This is relevant to a fixed risk threshold."))
+```
+
+For interpretation, an AUROC gap of 0.05 or a mean-risk gap of five percentage
+points is treated as a descriptive reason for closer review, rather than a
+formal test or a validated clinical cutoff. The following conclusions are
+computed from Table 9, so they follow the evaluated model and cohorts.
+
+```{python}
+#| label: subgroup-interpretation
+for variable in ["Age group", "Gender", "ICUType"]:
+    group = subgroups.loc[subgroups.Grouping.eq(variable) & subgroups.Deaths.ge(20)
+        & (subgroups.Stays - subgroups.Deaths).ge(20)].dropna(subset=["AUROC"])
+    if len(group) >= 2:
+        gap = group.AUROC.max() - group.AUROC.min()
+        attention = "warrants closer review" if gap >= .05 else "is below the descriptive 0.05 review threshold"
+        display(Markdown(f"The {variable} AUROC gap of {gap:.3f} {attention}; "
+            "case mix and the displayed intervals must also be considered."))
+notable = subgroups.loc[subgroups['Absolute risk gap'].ge(.05)]
+display(Markdown(f"There are {len(notable)} subgroup rows with absolute mean-risk gaps "
+    "of at least five percentage points. Such gaps could change who crosses the fixed clinical threshold; "
+    "they do not establish subgroup unfairness or a causal effect."))
+```
+
+These are exploratory comparisons: age, sex, and
+ICU analyses overlap, and multiple comparisons increase the chance of an
+apparently striking result. Small groups and wide intervals limit confidence;
+overlapping intervals alone are not a formal test of equal subgroup performance.
+
+# 3.6 Interpretation
+
+Feature labels use Glasgow Coma Scale (GCS), blood urea nitrogen (BUN),
+heart rate (HR), temperature (Temp), and arterial oxygen partial pressure
+(PaO2). Mechanical ventilation is labeled MechVent. The suffixes `_last`,
+`_mean`, `_minimum`, `_maximum`, `_slope`, and `_count` describe the 48-hour
+summaries; `_never` indicates that a variable was never measured.
+
+Tree Shapley additive explanations (SHAP) values explain contributions to the saved forest's mortality
+probability. Global importance is the mean absolute SHAP value in a reproducible
+random sample of 300 set-b stays. For computational simplicity, the explanation
+uses the tree-path-dependent background stored in the trained trees. These are
+model explanations, not estimates of treatment effects.
+
+```{python}
+#| label: model-interpretation
+preprocessor = model.named_steps["preprocess"]
+selector = model.named_steps["remove_constant"]
+forest = model.named_steps["model"]
+encoded_names = preprocessor.get_feature_names_out()[selector.get_support()]
+
+def transformed(frame):
+    return selector.transform(preprocessor.transform(frame[feature_columns]))
+
+def death_shap(frame):
+    values = np.asarray(explainer.shap_values(transformed(frame), check_additivity=True))
+    if values.ndim == 3:
+        return values[:, :, list(forest.classes_).index(1)]
+    if values.ndim == 2:
+        return values
+    raise ValueError("Unexpected SHAP output shape")
+
+explainer = shap.TreeExplainer(forest, feature_perturbation="tree_path_dependent")
+sample = tables["b"].sample(n=min(300, len(tables["b"])), random_state=SEED)
+shap_values = death_shap(sample)
+base_risk = float(np.asarray(explainer.expected_value)[list(forest.classes_).index(1)])
+np.testing.assert_allclose(base_risk + shap_values.sum(axis=1), sample.predicted_risk, atol=1e-6)
+importance = pd.DataFrame({"Predictor": encoded_names,
+                           "Mean absolute SHAP": np.abs(shap_values).mean(axis=0)})
+importance = importance.sort_values("Mean absolute SHAP", ascending=False)
+show_table(importance.head(15), "Leading predictors in the frozen random forest")
+importance.to_csv(OUT / "shap_importance.csv", index=False)
+fig, ax = plt.subplots(figsize=(7, 5))
+plot = importance.head(15).sort_values("Mean absolute SHAP")
+ax.barh(plot.Predictor, plot["Mean absolute SHAP"])
+ax.set(xlabel="Mean absolute contribution to mortality probability", title="Figure 4. Global SHAP importance")
+save_figure("shap_importance")
+
+# Compare with an existing GAM curve, without refitting the unsaved Model 2.
+shared = importance.loc[importance.Predictor.isin(["HR_mean", "Temp_mean", "Creatinine_last"])]
+variable = shared.iloc[0].Predictor
+background = set_a.sample(n=min(300, len(set_a)), random_state=SEED).copy()
+grid = np.linspace(*set_a[variable].quantile([.05, .95]), 40)
+pdp = []
+for value in grid:
+    modified = background[feature_columns].copy()
+    modified[variable] = value
+    pdp.append(model.predict_proba(modified)[:, 1].mean())
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.plot(grid, pdp)
+ax.set(xlabel=variable, ylabel="Average predicted mortality", title=f"Figure 5. Forest partial dependence: {variable}")
+save_figure("partial_dependence")
+html = (ROOT / "output" / "checkpoint2.html").read_text()
+image_tags = re.findall(r'<img\b[^>]*>', html)
+gam_tag = next((tag for tag in image_tags if 'id="gam-partial-effects"' in tag), None)
+if gam_tag is None:
+    raise ValueError("Could not locate the saved Model 2 GAM figure by its figure ID.")
+image_match = re.search(r'src="data:image/png;base64,([^"]+)"', gam_tag)
+if image_match is None:
+    raise ValueError("The saved Model 2 GAM figure must be embedded in checkpoint2.html.")
+gam_image = base64.b64decode(image_match.group(1))
+(OUT / "cp2_gam_partial_effects.png").write_bytes(gam_image)
+display(Markdown("**Figure 6. Saved Model 2 generalized additive model (GAM) curves from Checkpoint 2:**"))
+display(Image(data=gam_image))
+forest_shape = "increases" if pdp[-1] > pdp[0] else "decreases"
+gam_shape = {"HR_mean": "increases", "Temp_mean": "decreases", "Creatinine_last": "is nearly flat with a slight decrease"}[variable]
+rank = int(np.flatnonzero(importance.Predictor.to_numpy() == variable)[0]) + 1
+display(Markdown(f"The selected shared predictor, **{variable}**, ranks {rank} by mean absolute SHAP. "
+    f"Across the plotted range, the forest's average risk {forest_shape}; the corresponding saved GAM "
+    f"curve {gam_shape}. Compare the shape rather than the vertical values: forest partial dependence "
+    "is an average probability, while the GAM plot is a conditional odds ratio relative to its median. "
+    "Correlated measurements can also make the modified predictor combinations unrealistic."))
+```
+
+```{python}
+#| label: importance-interpretation
+leading = ", ".join(importance.head(3).Predictor)
+display(Markdown(f"Table 10 and Figure 4 identify **{leading}** as the three leading "
+    "encoded predictors by mean absolute SHAP. Their influence concerns this forest's predictions, "
+    "and correlated summaries can divide importance among related measurements. "
+    "Figures 5 and 6 compare the forest with the saved GAM on a shared predictor; "
+    "the local explanations below show contributions in individual stays."))
+```
+
+GCS denotes Glasgow Coma Scale, BUN blood urea nitrogen, HR heart rate,
+and Temp temperature. The encoded suffixes refer to summaries of the first
+48 hours (for example, `_last`, `_mean`, `_minimum`, and `_count`).
+
+Important predictors should not be interpreted causally. This observational
+model learns associations among severity, clinician behavior, and mortality.
+For example, a high measurement count may reflect clinicians monitoring a
+patient because the patient is deteriorating; it does not mean that taking more
+measurements causes death. Mechanical ventilation similarly reflects both
+treatment and the illness that prompted it. Adjusting a predictor in a partial
+dependence plot is not equivalent to intervening on a patient.
+
+```{python}
+#| label: own-model-causal-example
+care_features = importance.loc[importance.Predictor.str.contains(r"_count$|_never$|MechVent", regex=True)]
+if not care_features.empty:
+    care = care_features.iloc[0]
+    care_rank = int(np.flatnonzero(importance.Predictor.to_numpy() == care.Predictor)[0]) + 1
+    display(Markdown(f"In this model, **{care.Predictor}** is the highest-ranked monitoring, missingness, "
+        f"or ventilation feature (rank {care_rank}, mean absolute SHAP {care['Mean absolute SHAP']:.4f}). "
+        "Its predictive contribution can reflect severity or care practices, so it should not be read as a causal effect."))
+```
+
+# 3.7 Most confident mistakes on set-b
+
+The cases below are the five highest-risk survivors and the five lowest-risk
+patients who died. Local SHAP values identify the three largest contributions
+in either direction; a positive value raises the model's predicted mortality.
+Data-quality judgments use raw cleaning flags, the fraction of unmeasured
+time-series variables, and available clinical information. A probabilistic
+prediction can disagree with an outcome even when its estimated risk is valid.
+Negative sentinel codes indicate missing information and are not, by themselves,
+evidence of corrupted data.
+
+```{python}
+#| label: confident-mistakes
+b = tables["b"]
+high_survivors = b.loc[b.outcome.eq(0)].nlargest(5, "predicted_risk").copy()
+low_deaths = b.loc[b.outcome.eq(1)].nsmallest(5, "predicted_risk").copy()
+high_survivors["Error type"] = "Highest-risk survivor"
+low_deaths["Error type"] = "Lowest-risk death"
+mistakes = pd.concat([high_survivors, low_deaths], ignore_index=True)
+local_values = death_shap(mistakes)
+np.testing.assert_allclose(base_risk + local_values.sum(axis=1), mistakes.predicted_risk, atol=1e-6)
+raw_b = raw_tables["b"]
+never_columns = [f"{parameter}_never" for parameter in series_parameters]
+case_rows = []
+encoded_cases = transformed(mistakes)
+for i, row in mistakes.iterrows():
+    raw_case = raw_b.loc[raw_b.RecordID.eq(row.RecordID)]
+    bad = raw_case.loc[raw_case.negative_invalid | raw_case.outside_screen]
+    unmeasured = float(row[never_columns].astype(float).mean())
+    top = np.argsort(np.abs(local_values[i]))[-3:][::-1]
+    drivers = []
+    for j in top:
+        name = encoded_names[j]
+        value = row[name] if name in mistakes.columns else encoded_cases[i, j]
+        text = "missing; set-a imputation applied" if pd.isna(value) else f"{value:.3g}"
+        drivers.append(f"{name}={text} (SHAP {local_values[i, j]:+.3f})")
+    parameters = sorted(set(str(encoded_names[j]).rsplit("_", 1)[0] for j in top))
+    driver_flags = bad.loc[bad.Parameter.isin(parameters)]
+    if not driver_flags.empty:
+        judgment = (f"Possible data-quality contribution: {len(driver_flags)} raw values for leading "
+                    "driver variables were recoded as missing. Valid remaining observations and "
+                    "set-a imputation determine the input; the flags do not prove that data caused this error.")
+    elif unmeasured >= .50:
+        judgment = (f"Limited data coverage: {unmeasured:.0%} of series were never measured. "
+                    "The model relies partly on set-a imputation and availability patterns, so "
+                    "missing information may contribute; its effect on this outcome cannot be established.")
+    elif row.outcome == 0:
+        judgment = ("Model uncertainty or unrecorded recovery: the displayed SHAP drivers raise or lower "
+                    "risk as indicated. Treatment response, sedation, and reversible dysfunction could "
+                    "affect survival but are not established by these data. No clear cleaning problem "
+                    "was detected in the leading driver variables.")
+    else:
+        judgment = ("Model uncertainty or unrecorded later course: the available predictors support "
+                    "the displayed low risk but cannot exclude deterioration after 48 hours. "
+                    "No clear cleaning problem was detected in the leading driver variables; "
+                    "the cause of death is unavailable.")
+    flagged_parameters = ", ".join(sorted(bad.Parameter.unique())) or "None"
+    case_rows.append({"RecordID": int(row.RecordID), "Case": row["Error type"],
+        "Predicted risk": row.predicted_risk, "Died": int(row.outcome),
+        "Main prediction drivers": "; ".join(drivers), "Unmeasured variable fraction": unmeasured,
+        "Cleaned values": len(bad), "Flagged parameters": flagged_parameters, "Judgment": judgment})
+cases = pd.DataFrame(case_rows)
+show_table(cases[["RecordID", "Case", "Predicted risk", "Died", "Unmeasured variable fraction", "Cleaned values"]],
+           "Ten most confident disagreements with observed outcomes")
+for _, case in cases.iterrows():
+    display(Markdown(f"**Record {case.RecordID} — {case.Case}.** "
+        f"Prediction drivers: {case['Main prediction drivers']}. "
+        f"Cleaning flags: {case['Flagged parameters']}. Judgment: {case.Judgment}"))
+cases.to_csv(OUT / "confident_mistakes.csv", index=False)
+display(Markdown("Table 11 isolates the extreme disagreements; the case notes identify signed "
+    "prediction drivers and distinguish possible data coverage problems from model uncertainty "
+    "or unobserved clinical events. These are hypotheses, not confirmed causes of error."))
+```
+
+# 3.8 Written conclusions
+
+```{python}
+#| label: conclusions
+for letter, table in tables.items():
+    op = operating.loc[operating.Set.eq(f"set-{letter}")].iloc[0]
+    nb_model = net_benefit(table.outcome, table.predicted_risk, THRESHOLD)
+    nb_all = net_benefit(table.outcome, np.ones(len(table)), THRESHOLD)
+    useful = nb_model > max(0, nb_all)
+    display(Markdown(f"For the proposed 20% review policy on set-{letter}, the model flags "
+        f"**{op['Flagged per 100']:.1f} patients per 100**, identifies **{op.Sensitivity:.1%}** of deaths, "
+        f"and has a PPV of **{op.PPV:.1%}**. About "
+        f"**{op['Flagged per 100'] * (1 - op.PPV):.1f} survivors per 100 patients** would also be flagged. "
+        "Its net benefit "
+        + ("exceeds" if useful else "does not exceed")
+        + " both default strategies at that threshold."))
+```
+
+I would not recommend routine clinical deployment based on these evaluations
+alone. The calibration results above quantify overall bias and the spread of predicted
+log-odds, while Figure 2 and the risk-range tables locate any mismatch on the
+risk scale. The confidence intervals and sparse high-risk tails limit the
+precision of those conclusions.
+Where net benefit is positive relative to both default strategies, it supports
+further evaluation of this specific review policy, but the threshold's consequences and clinical workload
+need prospective assessment. Calibration matters because a 20% rule depends on
+the probability values, not just patient rankings. A mortality model cannot
+determine a patient's goals or whether a conversation is appropriate.
+
+Limitations: All three sets come from the same historical source, so these
+held-out results do not establish transportability to a different hospital or
+current practice. Summaries require a 48-hour window and cannot be used as an
+admission-time alert. This analysis follows the original cohort without a new
+48-hour landmark eligibility restriction; early deaths or discharge can affect
+which measurements are available, making clinical timing an additional
+limitation. Diagnoses, treatment responses after the window, patient preferences,
+and other clinical details are missing. Median imputation cannot recover this
+information. The forest's class weighting may affect probability calibration;
+the frozen predictions are evaluated as saved. The set-a-only SOFA mapping is
+an estimated benchmark, and small subgroup results are uncertain. Global SHAP
+importance is based on a sample, and correlated summaries can share importance.
+
+Leakage risk: Outcomes, identifiers, length of stay, survival time, SAPS-I,
+and SOFA are excluded from model predictors. Feature construction is checked
+against set-a, and all fitted prediction preprocessing comes from the saved
+set-a pipeline. Evaluation IDs are disjoint from set-a and each other.
+Checkpoint 2 performs preprocessing and tuning within its CV training folds;
+Checkpoint 3 never uses set-b/c outcomes to select predictors, tune the model,
+change the threshold, or recalibrate predictions. Nevertheless, measurement
+availability in a 48-hour summary can encode care and length of observation,
+so the design does not eliminate every clinical timing concern.
+
+Causal interpretation: No predictor is treated as causal. In particular,
+monitoring intensity, missingness, and ventilation may reflect severity and
+care decisions. Their SHAP values describe this model's predictions rather
+than the effects of changing treatment.
+
+```{python}
+#| label: reproducibility-check
+#| include: false
+model_hash_after = hashlib.sha256(model_path.read_bytes()).hexdigest()
+assert model_hash_after == model_hash_before, "The saved Checkpoint 2 model changed."
+verification = {
+    "saved_model_sha256_before": model_hash_before,
+    "saved_model_sha256_after": model_hash_after,
+    "model_name": bundle["model_name"],
+    "scikit_learn_version": sklearn.__version__,
+    "shap_version": shap.__version__,
+    "seed": SEED,
+    "auc_bootstrap_resamples": N_BOOT,
+    "calibration_bootstrap_resamples": CURVE_BOOT,
+    "analysis_minutes": (perf_counter() - START_TIME) / 60,
+    "evaluation_model_refitted": False,
+}
+(OUT / "verification.json").write_text(json.dumps(verification, indent=2) + "\n")
+```
+
+# References
+
+Rozen, S. (2026). [*Week 9: Evaluating Clinical Prediction Models, Part 1*](https://steverozen.github.io/biostat707_2026/lectures/w9/w9_evaluation_1.html).
+BIOSTAT 707 course materials. The evaluation follows the calibration approach
+specified in the assignment: a flexible curve, calibration intercept, and slope.
+
+Silva, I., Moody, G., Scott, D. J., Celi, L. A., & Mark, R. G. (2012).
+Predicting in-hospital mortality of ICU patients: The PhysioNet/Computing in
+Cardiology Challenge 2012. *Computing in Cardiology, 39*, 245–248.

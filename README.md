@@ -23,3 +23,21 @@ models, compares them with SAPS-I and SOFA, and writes the report to
 `output/cp2_modeling_table.csv`, `output/cp2_oof_predictions.csv`,
 `output/cp2_cv_results.csv`, and `output/cp2_final_model.joblib` for Checkpoint 3.
 The complete locked run took approximately 8.4 minutes on this laptop.
+
+
+## Checkpoint 3
+
+Checkpoint 3 uses Python in Quarto and the saved CP2 model, modeling table,
+CV results, and HTML report in `output/`. Keep the same Set A files and place
+Set B and Set C records in `data/set-b/` and `data/set-c/` (or the corresponding
+`.tar.gz` archives), with `Outcomes-b.txt` and `Outcomes-c.txt` in `data/`.
+Reproduce it from the repository root with `pixi run --locked checkpoint3`.
+The task automatically uses the separate locked environment in
+`cp3-environment/`, with scikit-learn 1.6.1. It evaluates the frozen model
+without retraining on Set B or Set C, covering discrimination, calibration,
+clinical usefulness, subgroups, predictor interpretation, and confident
+mistakes. The report is written to `output/checkpoint3.html`; additional
+predictions, metric tables, figures, and verification results are saved under
+`output/checkpoint3/` and ignored by Git. The analysis took approximately
+0.6 minutes in the checked run, excluding environment installation and HTML
+rendering.
